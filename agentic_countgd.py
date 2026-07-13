@@ -15,11 +15,11 @@ import mimetypes
 import textwrap
 from pathlib import Path
 
-import anthropic
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
-from PIL import Image
-from gradio_client import Client, handle_file
+import anthropic # pyright: ignore[reportMissingImports]
+import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
+from matplotlib.backends.backend_pdf import PdfPages # pyright: ignore[reportMissingModuleSource]
+from PIL import Image # pyright: ignore[reportMissingImports]
+from gradio_client import Client, handle_file # pyright: ignore[reportMissingImports]
 
 MODEL = "claude-opus-4-8"
 COUNTGD_SPACE = "nikigoli/countgd"
