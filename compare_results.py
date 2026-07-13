@@ -16,13 +16,13 @@ import argparse
 import textwrap
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import numpy as np
-from matplotlib.backends.backend_pdf import PdfPages
-from PIL import Image
-from scipy import ndimage
-from scipy.spatial import cKDTree
-from skimage.feature import peak_local_max
+import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
+import numpy as np # pyright: ignore[reportMissingImports]
+from matplotlib.backends.backend_pdf import PdfPages # pyright: ignore[reportMissingModuleSource]
+from PIL import Image # pyright: ignore[reportMissingImports]
+from scipy import ndimage # pyright: ignore[reportMissingImports]
+from scipy.spatial import cKDTree # pyright: ignore[reportMissingImports]
+from skimage.feature import peak_local_max # pyright: ignore[reportMissingModuleSource]
 
 PDF_NAME = "comparison_results.pdf"
 
