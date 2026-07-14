@@ -50,15 +50,15 @@ import textwrap
 import zipfile
 from pathlib import Path
 
-import anthropic
-import fsspec
-import matplotlib.pyplot as plt
-import numpy as np
-import numpy.lib.format as npy_format
-from csbdeep.utils import normalize
-from matplotlib.backends.backend_pdf import PdfPages
-from PIL import Image
-from stardist.models import StarDist2D
+import anthropic # pyright: ignore[reportMissingImports]
+import fsspec # pyright: ignore[reportMissingImports]
+import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
+import numpy as np # pyright: ignore[reportMissingImports]
+import numpy.lib.format as npy_format # pyright: ignore[reportMissingImports]
+from csbdeep.utils import normalize # pyright: ignore[reportMissingImports]
+from matplotlib.backends.backend_pdf import PdfPages # pyright: ignore[reportMissingModuleSource]
+from PIL import Image # pyright: ignore[reportMissingImports]
+from stardist.models import StarDist2D # pyright: ignore[reportMissingImports]
 
 MODEL = "claude-opus-4-8"
 PRETRAINED_MODEL = "2D_versatile_he"
@@ -306,15 +306,15 @@ def compute_panoptic_quality(pred_labels: np.ndarray, gt_labels: np.ndarray, iou
 
 
 def save_overlay(image: np.ndarray, labels: np.ndarray, overlay_path: Path) -> None:
-    from skimage.color import label2rgb
+    from skimage.color import label2rgb # pyright: ignore[reportMissingImports]
     overlay = label2rgb(labels, image=image, bg_label=0)
     Image.fromarray((overlay * 255).astype(np.uint8)).save(overlay_path)
 
 
 def save_instance_outlines(image: np.ndarray, labels: np.ndarray, outlines_path: Path) -> None:
     """Draw each nucleus's boundary over the original image, one distinct color per instance ID."""
-    import matplotlib as mpl
-    from skimage.segmentation import find_boundaries
+    import matplotlib as mpl # pyright: ignore[reportMissingModuleSource]
+    from skimage.segmentation import find_boundaries # pyright: ignore[reportMissingImports]
 
     num_instances = int(labels.max())
     outlined = image.copy()
