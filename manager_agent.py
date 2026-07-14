@@ -16,9 +16,9 @@ Usage:
 """
 import argparse
 
-import anthropic
-from gradio_client import Client
-from stardist.models import StarDist2D
+import anthropic # pyright: ignore[reportMissingImports]
+from gradio_client import Client # pyright: ignore[reportMissingImports]
+from stardist.models import StarDist2D # pyright: ignore[reportMissingImports]
 
 from agentic_countgd import COUNTGD_SPACE, interpret_prompt, run_countgd
 from agentic_stardist import PRETRAINED_MODEL, load_image, run_stardist
