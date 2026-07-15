@@ -35,12 +35,12 @@ import sys
 import textwrap
 from pathlib import Path
 
-import anthropic
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
-from matplotlib.backends.backend_pdf import PdfPages
-from PIL import Image, ImageDraw
+import anthropic # pyright: ignore[reportMissingImports]
+import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
+import numpy as np # pyright: ignore[reportMissingImports]
+import torch # pyright: ignore[reportMissingImports]
+from matplotlib.backends.backend_pdf import PdfPages # pyright: ignore[reportMissingModuleSource]
+from PIL import Image, ImageDraw # pyright: ignore[reportMissingImports]
 
 MODEL = "claude-opus-4-8"
 PDF_NAME = "cellvit_results.pdf"
@@ -53,7 +53,7 @@ def load_cellvit_module(cellvit_repo: str):
     if cellvit_repo:
         sys.path.insert(0, str(Path(cellvit_repo).resolve()))
     try:
-        from cell_segmentation.inference.cell_detection import (
+        from cell_segmentation.inference.cell_detection import ( # pyright: ignore[reportMissingImports]
             CellSegmentationInference,
             COLOR_DICT,
         )
