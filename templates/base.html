@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ title or "BioAssist" }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="topbar">
+    <button id="sidebar-toggle" class="hamburger" aria-label="Open menu" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
+    <a href="{{ url_for('index') }}" class="brand">
+      <span class="brand-dot"></span>
+      BioAssist
+    </a>
+  </div>
+
+  <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
+  <nav id="sidebar" class="sidebar">
+    <div class="sidebar-header">Navigate</div>
+    <a href="{{ url_for('index') }}" class="sidebar-link {{ 'active' if request.endpoint == 'index' else '' }}">
+      <span class="sidebar-icon">
+        <svg class="icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M3 9.5L10 3l7 6.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M5 8.5V16.5C5 16.776 5.224 17 5.5 17H8.5C8.776 17 9 16.776 9 16.5V12.5C9 12.224 9.224 12 9.5 12H10.5C10.776 12 11 12.224 11 12.5V16.5C11 16.776 11.224 17 11.5 17H14.5C14.776 17 15 16.776 15 16.5V8.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </span>
+      Home
+    </a>
+    <a href="{{ url_for('agentic') }}" class="sidebar-link {{ 'active' if request.endpoint == 'agentic' else '' }}">
+      <span class="sidebar-icon">
+        <svg class="icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="10" cy="10" r="6.5" stroke="currentColor" stroke-width="1.6"/>
+          <circle cx="10" cy="10" r="2" stroke="currentColor" stroke-width="1.6"/>
+          <path d="M10 1.5V4M10 16V18.5M1.5 10H4M16 10H18.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+        </svg>
+      </span>
+      Agentic Count
+    </a>
+    <a href="{{ url_for('compare') }}" class="sidebar-link {{ 'active' if request.endpoint == 'compare' else '' }}">
+      <span class="sidebar-icon">
+        <svg class="icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M3 17V10M10 17V3M17 17V13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>
+      </span>
+      Comparison
+    </a>
+  </nav>
+
+  <main class="page">
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
+      {% endif %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</body>
+</html>
