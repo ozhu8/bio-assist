@@ -331,7 +331,7 @@ def compute_panoptic_quality(pred_labels: np.ndarray, gt_labels: np.ndarray, iou
 
 def save_overlay(image: np.ndarray, labels: np.ndarray, overlay_path: Path) -> None:
     from skimage.color import label2rgb # pyright: ignore[reportMissingImports]
-    overlay = label2rgb(labels, image=image, bg_label=0)
+    overlay = label2rgb(labels, image=image, bg_label=0) # pyright: ignore[reportMissingImports]
     Image.fromarray((overlay * 255).astype(np.uint8)).save(overlay_path)
 
 
