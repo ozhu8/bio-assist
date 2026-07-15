@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="page-sub" id="progress-stage">Starting…</p>
+
+<div class="progress-track">
+  <div class="progress-fill" id="progress-fill" style="width: 0%;"></div>
+</div>
+<div class="progress-meta">
+  <span id="progress-percent">0%</span>
+  <span id="progress-elapsed">0:00 elapsed</span>
+</div>
+<p class="progress-stall-note" id="progress-stall-note" hidden>
+  Still working &mdash; a single step (usually Claude evaluating a result) can take a
+  few minutes if Anthropic's API is under heavy load. This page hasn't frozen.
+</p>
+
+<div class="progress-actions">
+  <button type="button" id="stop-btn" class="btn-stop">Stop</button>
+  <span class="progress-stop-note">Stops after the current step finishes &mdash; not instant.</span>
+</div>
+
+<div id="progress-error" class="flash" hidden></div>
+
+<script>
+  (function () {
+    var runId = {{ run_id | tojson }};
+    var backUrl = {{ back_url | tojson }};
+    var fill = document.getElementById("progress-fill");
+    var percent = document.getElementById("progress-percent");
+    var elapsedEl = document.getElementById("progress-elapsed");
+    var stage = document.getElementById("progress-stage");
+    var errorBox = document.getElementById("progress-error");
+    var stallNote = document.getElementById("progress-stall-note");
+    var stopBtn = document.getElementById("stop-btn");
+    var stopActions = document.querySelector(".progress-actions");
+
+    var startedAt = Date.now();
+    var lastStage = null;
+    var lastStageChangedAt = startedAt;
+    var STALL_THRESHOLD_MS = 20000;
+    var stopRequested = false;
+
+    function formatElapsed(ms) {
+      var totalSeconds = Math.floor(ms / 1000);
+      var minutes = Math.floor(totalSeconds / 60);
+      var seconds = totalSeconds % 60;
+      return minutes + ":" + (seconds < 10 ? "0" : "") + seconds;
+    }
+
+    setInterval(function () {
+      var now = Date.now();
+      elapsedEl.textContent = formatElapsed(now - startedAt) + " elapsed";
+      stallNote.hidden = stopRequested || now - lastStageChangedAt < STALL_THRESHOLD_MS;
+    }, 1000);
+
+    stopBtn.addEventListener("click", function () {
+      stopRequested = true;
+      stopBtn.disabled = true;
+      stopBtn.textContent = "Stopping…";
+      stallNote.hidden = true;
+      fetch("/cancel/" + runId, { method: "POST" }).catch(function () {});
+    });
+
+    function poll() {
+      fetch("/progress/" + runId)
+        .then(function (res) { return res.json(); })
+        .then(function (data) {
+          if (data.status === "cancelled") {
+            // No confirmation screen — go straight back to where the run
+            // was started so the user can just try again.
+            window.location.href = backUrl;
+            return;
+          }
+          if (data.status === "error") {
+            stopActions.hidden = true;
+            stallNote.hidden = true;
+            errorBox.textContent = data.stage || "Something went wrong.";
+            errorBox.hidden = false;
+            return;
+          }
+          var pct = Math.max(0, Math.min(100, data.progress || 0));
+          fill.style.width = pct + "%";
+          percent.textContent = pct + "%";
+          stage.textContent = data.stage || "";
+
+          if (data.stage !== lastStage) {
+            lastStage = data.stage;
+            lastStageChangedAt = Date.now();
+            if (!stopRequested) stallNote.hidden = true;
+          }
+
+          if (data.status === "done" && data.redirect) {
+            window.location.href = data.redirect;
+            return;
+          }
+          setTimeout(poll, 900);
+        })
+        .catch(function () { setTimeout(poll, 1500); });
+    }
+    poll();
+  })();
+</script>
+{% endblock %}
