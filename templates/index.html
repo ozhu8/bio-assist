@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <h1>BioAssist</h1>
+  <p class="hero-sub">
+    Claude orchestrates CountGD to count objects in your images, evaluates its own
+    results, and retries with a sharper prompt until it's confident &mdash; then hands
+    you a PDF report you can view right here, no download required.
+  </p>
+</section>
+
+<section class="card-grid">
+  <a class="feature-card" href="{{ url_for('agentic') }}">
+    <div class="feature-icon">
+      <svg class="icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="10" cy="10" r="6.5" stroke="currentColor" stroke-width="1.6"/>
+        <circle cx="10" cy="10" r="2" stroke="currentColor" stroke-width="1.6"/>
+        <path d="M10 1.5V4M10 16V18.5M1.5 10H4M16 10H18.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+    </div>
+    <h2>Agentic Count</h2>
+    <p>Upload an image, describe the task, and let Claude + CountGD handle the rest.</p>
+    <span class="feature-cta">Get started &rarr;</span>
+  </a>
+  <a class="feature-card" href="{{ url_for('compare') }}">
+    <div class="feature-icon">
+      <svg class="icon" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M3 17V10M10 17V3M17 17V13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+      </svg>
+    </div>
+    <h2>Comparison</h2>
+    <p>Pit the agentic result against a finished CountGD-alone baseline, side by side.</p>
+    <span class="feature-cta">Get started &rarr;</span>
+  </a>
+</section>
+{% endblock %}
