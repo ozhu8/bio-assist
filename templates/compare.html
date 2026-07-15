@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Compare vs. baseline</h1>
+<p class="page-sub">Run one image through Claude + CountGD, and compare it against an already-finished CountGD-alone result.</p>
+
+<form method="post" enctype="multipart/form-data" data-loading-form>
+  <label class="field-label" for="agentic_source_mode">Agentic image source</label>
+  <select id="agentic_source_mode" name="agentic_source_mode">
+    <option value="run" selected>Run with agent (Claude + CountGD)</option>
+    <option value="finished">I already have a finished result</option>
+  </select>
+
+  <div data-agentic-source-group="run">
+    <label class="field-label">Image to run Claude + CountGD on</label>
+    <div class="dropzone" data-dropzone>
+      <input type="file" id="raw_image" name="raw_image" accept="image/*" class="dropzone-input" data-required-in>
+      <div class="dropzone-drag-overlay">Drop file here</div>
+      <div class="dropzone-body">
+        <div class="dropzone-icon">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="1.6"/>
+            <circle cx="8.5" cy="9.5" r="1.5" stroke="currentColor" stroke-width="1.6"/>
+            <path d="M3 16.5L8 12L11.5 15L15.5 10.5L21 16" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <p class="dropzone-text-default">Click to browse or drag an image here</p>
+        <p class="dropzone-formats">Accepts PNG, JPG, or WEBP</p>
+        <p class="dropzone-change-hint" hidden>Click to choose a different image</p>
+      </div>
+      <img class="dropzone-preview" alt="Selected raw image preview" hidden>
+    </div>
+
+    <label class="field-label" for="prompt">Task</label>
+    <textarea id="prompt" name="prompt" rows="2" placeholder="e.g. count the individual cells" data-required-in></textarea>
+  </div>
+
+  <div data-agentic-source-group="finished" hidden>
+    <label class="field-label">Finished agentic result image</label>
+    <div class="dropzone" data-dropzone>
+      <input type="file" id="agentic_finished_image" name="agentic_finished_image" accept="image/*" class="dropzone-input" data-required-in>
+      <div class="dropzone-drag-overlay">Drop file here</div>
+      <div class="dropzone-body">
+        <div class="dropzone-icon">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="1.6"/>
+            <circle cx="8.5" cy="9.5" r="1.5" stroke="currentColor" stroke-width="1.6"/>
+            <path d="M3 16.5L8 12L11.5 15L15.5 10.5L21 16" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <p class="dropzone-text-default">Click to browse or drag an image here</p>
+        <p class="dropzone-formats">Accepts PNG, JPG, or WEBP</p>
+        <p class="dropzone-change-hint" hidden>Click to choose a different image</p>
+      </div>
+      <img class="dropzone-preview" alt="Selected finished agentic image preview" hidden>
+    </div>
+
+    <label class="field-label" for="agentic_finished_count">Count (optional)</label>
+    <input type="number" id="agentic_finished_count" name="agentic_finished_count" placeholder="Leave blank to estimate it from the image">
+
+    <label class="field-label" for="agentic_finished_label">What was counted (optional)</label>
+    <input type="text" id="agentic_finished_label" name="agentic_finished_label" placeholder="e.g. cell">
+
+    <p class="mode-note">No Claude or CountGD call happens for this side &mdash; it's compared as-is against the baseline below.</p>
+  </div>
+
+  <label class="field-label" for="baseline_mode">Baseline source</label>
+  <select id="baseline_mode" name="baseline_mode">
+    <option value="run" selected>Run CountGD alone here</option>
+    <option value="finished">I already have a finished CountGD result</option>
+  </select>
+
+  <div data-baseline-group="finished" hidden>
+    <label class="field-label">Finished CountGD-alone result image</label>
+    <div class="dropzone" data-dropzone>
+      <input type="file" id="baseline_image" name="baseline_image" accept="image/*" class="dropzone-input" data-required-in>
+      <div class="dropzone-drag-overlay">Drop file here</div>
+      <div class="dropzone-body">
+        <div class="dropzone-icon">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="1.6"/>
+            <circle cx="8.5" cy="9.5" r="1.5" stroke="currentColor" stroke-width="1.6"/>
+            <path d="M3 16.5L8 12L11.5 15L15.5 10.5L21 16" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <p class="dropzone-text-default">Click to browse or drag an image here</p>
+        <p class="dropzone-formats">Accepts PNG, JPG, or WEBP</p>
+        <p class="dropzone-change-hint" hidden>Click to choose a different image</p>
+      </div>
+      <img class="dropzone-preview" alt="Selected baseline image preview" hidden>
+    </div>
+
+    <label class="field-label" for="baseline_count">Baseline count (optional)</label>
+    <input type="number" id="baseline_count" name="baseline_count" placeholder="Leave blank to estimate it from the image">
+  </div>
+
+  <div data-baseline-group="run">
+    <label class="field-label">Image to run CountGD alone on</label>
+    <div class="dropzone" data-dropzone>
+      <input type="file" id="baseline_raw_image" name="baseline_raw_image" accept="image/*" class="dropzone-input" data-required-in>
+      <div class="dropzone-drag-overlay">Drop file here</div>
+      <div class="dropzone-body">
+        <div class="dropzone-icon">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" stroke-width="1.6"/>
+            <circle cx="8.5" cy="9.5" r="1.5" stroke="currentColor" stroke-width="1.6"/>
+            <path d="M3 16.5L8 12L11.5 15L15.5 10.5L21 16" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <p class="dropzone-text-default">Click to browse or drag an image here</p>
+        <p class="dropzone-formats">Accepts PNG, JPG, or WEBP</p>
+        <p class="dropzone-change-hint" hidden>Click to choose a different image</p>
+      </div>
+      <img class="dropzone-preview" alt="Selected baseline raw image preview" hidden>
+    </div>
+
+    <label class="field-label" for="baseline_text">Text for CountGD to count</label>
+    <input type="text" id="baseline_text" name="baseline_text" placeholder="e.g. cell" data-required-in>
+    <p class="mode-note">
+      Calls CountGD's own endpoint directly, the same one its
+      <a href="https://huggingface.co/spaces/nikigoli/countgd" target="_blank" rel="noopener">public Space</a>
+      uses &mdash; same image and text in, same result out. Claude has no part in this step.
+    </p>
+  </div>
+
+  <label class="field-label" for="baseline_label">Baseline label (optional)</label>
+  <input type="text" id="baseline_label" name="baseline_label" placeholder="Defaults to the CountGD text above, or “CountGD alone”">
+
+  <button type="submit" class="btn-primary">Compare</button>
+</form>
+{% endblock %}
