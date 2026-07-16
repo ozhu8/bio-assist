@@ -21,9 +21,9 @@ import re
 import zipfile
 from pathlib import Path
 
-import fsspec
-import numpy as np
-from PIL import Image
+import fsspec # pyright: ignore[reportMissingImports]
+import numpy as np # pyright: ignore[reportMissingImports]
+from PIL import Image # pyright: ignore[reportMissingImports]
 
 BBBC005_IMAGES_URL = "https://data.broadinstitute.org/bbbc/BBBC005/BBBC005_v1_images.zip"
 _FILENAME_RE = re.compile(

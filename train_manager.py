@@ -24,7 +24,7 @@ import argparse
 import json
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image # pyright: ignore[reportMissingImports]
 
 from bbbc005 import load_bbbc005_samples
 from manager_agent import ManagerAgent, MODEL_ID, run_countgd_with_feedback, run_stardist_with_feedback

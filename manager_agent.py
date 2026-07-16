@@ -342,7 +342,7 @@ def _stardist_worker_init(image_path: str):
     """Runs inside the spawned subprocess. Loads (and caches) the StarDist model and the image."""
     global _worker_model
     from agentic_stardist import PRETRAINED_MODEL, load_image
-    from stardist.models import StarDist2D
+    from stardist.models import StarDist2D # pyright: ignore[reportMissingImports]
     if _worker_model is None:
         _worker_model = StarDist2D.from_pretrained(PRETRAINED_MODEL)
     image = load_image(image_path)
