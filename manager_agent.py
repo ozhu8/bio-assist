@@ -64,9 +64,9 @@ import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-import numpy as np
-from gradio_client import Client
-from PIL import Image
+import numpy as np # pyright: ignore[reportMissingImports]
+from gradio_client import Client # pyright: ignore[reportMissingImports]
+from PIL import Image # pyright: ignore[reportMissingImports]
 
 from agentic_countgd import COUNTGD_SPACE, run_countgd
 
@@ -93,7 +93,7 @@ class QwenVLM:
 
     def _load(self):
         if self._model is None:
-            from transformers import AutoModelForImageTextToText, AutoProcessor
+            from transformers import AutoModelForImageTextToText, AutoProcessor # pyright: ignore[reportMissingImports]
             self._model = AutoModelForImageTextToText.from_pretrained(
                 self.model_id, dtype="auto", device_map=self.device_map
             )
@@ -101,7 +101,7 @@ class QwenVLM:
         return self._model, self._processor
 
     def ask(self, image_path: str, prompt: str, max_new_tokens: int = 512) -> str:
-        from qwen_vl_utils import process_vision_info
+        from qwen_vl_utils import process_vision_info # pyright: ignore[reportMissingImports]
         model, processor = self._load()
 
         messages = [{
@@ -121,12 +121,22 @@ class QwenVLM:
         trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
         return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
 
-    def ask_json(self, image_path: str, prompt: str, max_new_tokens: int = 512) -> dict:
+    def ask_json(self, image_path: str, prompt: str, max_new_tokens: int = 512, required_keys: list = None) -> dict:
+        """Unlike the Claude calls in agentic_countgd.py/agentic_stardist.py, Qwen has no
+        API-enforced JSON schema, so its free-text output can drop a requested key. Callers
+        that will subscript the result (e.g. result["score"]) should pass required_keys so a
+        malformed response fails here with a clear message instead of a bare KeyError deep in
+        the caller."""
         raw = self.ask(image_path, prompt, max_new_tokens=max_new_tokens)
         start, end = raw.find("{"), raw.rfind("}")
         if start == -1 or end == -1:
             raise ValueError(f"Qwen response did not contain a JSON object: {raw!r}")
-        return json.loads(raw[start:end + 1])
+        result = json.loads(raw[start:end + 1])
+        if required_keys:
+            missing = [k for k in required_keys if k not in result]
+            if missing:
+                raise ValueError(f"Qwen JSON response is missing required key(s) {missing}: {result!r}")
+        return result
 
     def ask_text(self, prompt: str, max_new_tokens: int = 512) -> str:
         """Text-only turn, no image -- for prompts that summarize patterns across multiple
@@ -182,13 +192,13 @@ def evaluate_countgd_visual(
         "(1) do the boxes look visually accurate (no obvious double-counts, missed objects, "
         "or false positives)? (2) is the count plausible? (3) does this satisfy the user's "
         "original request?\n"
-        "Score 0-10. If score < 7 and a different/more specific text prompt would plausibly "
-        "fix it, set accept=false and give revised_text to retry with. Otherwise set "
-        "accept=true and revised_text=null.\n\n"
+        f"Score 0-10. If score < {ACCEPT_SCORE_THRESHOLD} and a different/more specific text "
+        "prompt would plausibly fix it, set accept=false and give revised_text to retry with. "
+        "Otherwise set accept=true and revised_text=null.\n\n"
         "Reply with ONLY a JSON object matching this schema: "
         "{\"accept\": bool, \"score\": int, \"feedback\": str, \"revised_text\": str or null}"
     )
-    return qwen.ask_json(annotated_image_path, prompt)
+    return qwen.ask_json(annotated_image_path, prompt, required_keys=["accept", "score", "feedback"])
 
 
 def propose_countgd_revision(
@@ -210,7 +220,7 @@ def propose_countgd_revision(
         "far too high, the target may be matching background clutter or double-counting.\n\n"
         "Reply with ONLY a JSON object matching this schema: {\"revised_text\": str, \"feedback\": str}"
     )
-    return qwen.ask_json(annotated_image_path, prompt)
+    return qwen.ask_json(annotated_image_path, prompt, required_keys=["feedback"])
 
 
 def evaluate_stardist_visual(
@@ -228,16 +238,16 @@ def evaluate_stardist_visual(
         "(no obvious missed nuclei, false positives, or merged/split instances)? (2) is the "
         "nucleus count plausible for what's shown? (3) does this satisfy the user's original "
         "request?\n"
-        "Score 0-10. If score < 7, propose revised threshold(s): raise prob_thresh if you see "
-        "false-positive outlines on background/noise, lower it if real nuclei look missed; "
-        "lower nms_thresh if you see duplicate/split outlines around one nucleus, raise it if "
-        "adjacent distinct nuclei look merged into one outline. Only set the threshold(s) that "
-        "address the problem -- leave the other null. Otherwise set accept=true and leave both "
-        "revised fields null.\n\n"
+        f"Score 0-10. If score < {ACCEPT_SCORE_THRESHOLD}, propose revised threshold(s): raise "
+        "prob_thresh if you see false-positive outlines on background/noise, lower it if real "
+        "nuclei look missed; lower nms_thresh if you see duplicate/split outlines around one "
+        "nucleus, raise it if adjacent distinct nuclei look merged into one outline. Only set "
+        "the threshold(s) that address the problem -- leave the other null. Otherwise set "
+        "accept=true and leave both revised fields null.\n\n"
         "Reply with ONLY a JSON object matching this schema: {\"accept\": bool, \"score\": int, "
         "\"feedback\": str, \"revised_prob_thresh\": number or null, \"revised_nms_thresh\": number or null}"
     )
-    return qwen.ask_json(outlines_image_path, prompt)
+    return qwen.ask_json(outlines_image_path, prompt, required_keys=["accept", "score", "feedback"])
 
 
 def propose_stardist_revision(
@@ -266,7 +276,7 @@ def propose_stardist_revision(
         "Reply with ONLY a JSON object matching this schema: "
         "{\"revised_prob_thresh\": number or null, \"revised_nms_thresh\": number or null, \"feedback\": str}"
     )
-    return qwen.ask_json(outlines_image_path, prompt)
+    return qwen.ask_json(outlines_image_path, prompt, required_keys=["feedback"])
 
 
 def run_countgd_with_feedback(
@@ -356,6 +366,19 @@ def _stardist_worker_load_pannuke(fold: int, index: int):
     return load_pannuke_sample(fold, index)
 
 
+def _stardist_worker_revert_to_best(image: np.ndarray, history: list, outlines_path: Path):
+    """Runs inside the spawned subprocess. best_entry is pure logic (max(history, key=pq)) but
+    lives in agentic_stardist.py, so it still needs to run in here rather than the parent --
+    see the module docstring. Returns None if the last iteration tried was already the best."""
+    from agentic_stardist import best_entry, run_stardist, save_instance_outlines
+    best = best_entry(history)
+    if best["iteration"] == history[-1]["iteration"]:
+        return None
+    labels, _ = run_stardist(_worker_model, image, prob_thresh=best["prob_thresh"], nms_thresh=best["nms_thresh"])
+    save_instance_outlines(image, labels, outlines_path)
+    return {"labels": labels, "best_iteration": best["iteration"], "best_pq": best["pq"]}
+
+
 class StardistWorker:
     """Owns a single persistent spawned subprocess that all StarDist calls are routed through --
     see the module docstring for why StarDist/TensorFlow can't share a process with torch/ROCm.
@@ -376,6 +399,9 @@ class StardistWorker:
 
     def load_pannuke_sample(self, fold: int, index: int):
         return self._pool.submit(_stardist_worker_load_pannuke, fold, index).result()
+
+    def revert_to_best(self, image: np.ndarray, history: list, outlines_path: Path):
+        return self._pool.submit(_stardist_worker_revert_to_best, image, history, outlines_path).result()
 
     def shutdown(self):
         self._pool.shutdown(wait=True)
@@ -440,6 +466,17 @@ def run_stardist_with_feedback(
             prob_thresh = revised_prob
         if revised_nms is not None:
             nms_thresh = revised_nms
+
+    if ground_truth_labels is not None:
+        revert = worker.revert_to_best(image, history, output_dir / "stardist_best.png")
+        if revert is not None:
+            print(
+                f"  search continued past its best result -- reverting to iteration "
+                f"{revert['best_iteration']} (PQ={revert['best_pq']:.3f}) instead of the last one "
+                f"tried (PQ={history[-1]['pq']:.3f})"
+            )
+            labels = revert["labels"]
+            saved_path = output_dir / "stardist_best.png"
 
     return {
         "agent": "stardist", "num_nuclei": int(labels.max()), "labels": labels,
