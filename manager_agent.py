@@ -128,6 +128,18 @@ class QwenVLM:
             raise ValueError(f"Qwen response did not contain a JSON object: {raw!r}")
         return json.loads(raw[start:end + 1])
 
+    def ask_text(self, prompt: str, max_new_tokens: int = 512) -> str:
+        """Text-only turn, no image -- for prompts that summarize patterns across multiple
+        images/notes rather than looking at any one of them (see train_manager.py)."""
+        model, processor = self._load()
+        messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+        chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=[chat_text], padding=True, return_tensors="pt").to(model.device)
+
+        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
+        return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
+
 
 def select_agent(qwen: QwenVLM, task_description: str, image_path: str) -> str:
     prompt = (
