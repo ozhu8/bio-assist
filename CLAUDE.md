@@ -73,6 +73,19 @@ Verified end-to-end with `python -c "import manager_agent"` succeeding in
 `.venv-manager` before these venvs were deleted, and (2026-07-16) with a real
 Qwen3-VL-8B load + generation on the GPU after the ROCm reinstall above.
 
+**This is a shared machine -- `gradio_client` calls (CountGD) fail with
+`PermissionError: /tmp/gradio/...` unless `GRADIO_TEMP_DIR` is set.** By default
+`gradio_client` downloads files to `$TMPDIR/gradio` (`/tmp/gradio`), and another
+user on this box (`olivia`) already owns that directory with mode 775 -- `hannah`
+can list it but can't `mkdir` inside it, which is what every CountGD call needs to
+do to save its result image. Fix: export `GRADIO_TEMP_DIR=/home/hannah/.gradio_tmp`
+(or any directory `hannah` owns) before running anything that calls CountGD
+(`agentic_countgd.py`, `manager_agent.py`, `train_manager.py`). Verified
+(2026-07-16): `train_manager.py --countgd-n 1 --stardist-n 1` failed with the
+PermissionError above without this set, and completed cleanly (~3 min end to end,
+including a real CountGD call, a real StarDist/PanNuke trial, and a real Qwen
+batch-summarization call) with it set.
+
 **TensorFlow (imported transitively by `agentic_stardist.py`, via `stardist`) cannot
 share a process with GPU torch here.** TensorFlow bundles its own LLVM (for XLA);
 ROCm's kernel compiler / Triton also bundles LLVM. The instant both are loaded in one
