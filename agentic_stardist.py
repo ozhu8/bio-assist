@@ -43,6 +43,7 @@ Usage:
 """
 import argparse
 import base64
+import contextlib
 import json
 import mimetypes
 import random
@@ -153,13 +154,23 @@ def _read_array_prefix(zf: zipfile.ZipFile, member: str, n: int, retries: int = 
 PANNUKE_HTTP_BLOCK_SIZE = 512 * 1024
 
 
-def _open_pannuke_zip(fold: int) -> zipfile.ZipFile:
+@contextlib.contextmanager
+def _open_pannuke_zip(fold: int, block_size: int = None):
     """fsspec's default HTTP block size (~5MB) is what PanNuke's server actually times
     out mid-transfer on -- observed failing at a consistent ~4.2-4.6MB into a ~5MB block
     regardless of how small a chunk_size Python-level .read() calls request, since that
     caching/prefetch layer sits below the read() call. A much smaller block_size here
-    makes each underlying HTTP range request small enough to reliably complete."""
-    return zipfile.ZipFile(fsspec.open(PANNUKE_FOLD_URL.format(fold=fold), block_size=PANNUKE_HTTP_BLOCK_SIZE).open())
+    makes each underlying HTTP range request small enough to reliably complete.
+    Context manager so the underlying fsspec HTTP handle (which ZipFile.close() does not
+    close, since it didn't open the path itself) always gets closed too."""
+    open_kwargs = {"block_size": block_size} if block_size is not None else {}
+    fp = fsspec.open(PANNUKE_FOLD_URL.format(fold=fold), **open_kwargs).open()
+    zf = zipfile.ZipFile(fp)
+    try:
+        yield zf
+    finally:
+        zf.close()
+        fp.close()
 
 
 def load_pannuke_images(fold: int, n: int):
@@ -167,14 +178,13 @@ def load_pannuke_images(fold: int, n: int):
     fold archive via HTTP range requests: only enough of the DEFLATE-compressed
     images.npy/types.npy streams is decompressed to cover n images, so this
     never downloads the full ~700MB zip."""
-    zf = _open_pannuke_zip(fold)
+    with _open_pannuke_zip(fold, block_size=PANNUKE_HTTP_BLOCK_SIZE) as zf:
+        with zf.open(f"Fold {fold}/images/fold{fold}/types.npy") as tf:
+            _, _, dtype = _read_npy_header(tf)
+            types = np.frombuffer(tf.read(n * dtype.itemsize), dtype=dtype)[:n]
 
-    with zf.open(f"Fold {fold}/images/fold{fold}/types.npy") as tf:
-        _, _, dtype = _read_npy_header(tf)
-        types = np.frombuffer(tf.read(n * dtype.itemsize), dtype=dtype)[:n]
-
-    raw, shape, dtype = _read_array_prefix(zf, f"Fold {fold}/images/fold{fold}/images.npy", n)
-    images = np.frombuffer(raw, dtype=dtype).reshape((n,) + shape[1:])
+        raw, shape, dtype = _read_array_prefix(zf, f"Fold {fold}/images/fold{fold}/images.npy", n)
+        images = np.frombuffer(raw, dtype=dtype).reshape((n,) + shape[1:])
 
     return images.astype(np.uint8), [str(t) for t in types]
 
@@ -183,10 +193,10 @@ def load_pannuke_types(fold: int) -> list:
     """Fetch every image's tissue-type label for a fold in one shot -- types.npy is a few
     KB, independent of the multi-GB images.npy/masks.npy streams, so this lets diverse
     sampling see the whole fold's tissue layout without paying for image/mask data."""
-    zf = zipfile.ZipFile(fsspec.open(PANNUKE_FOLD_URL.format(fold=fold)).open())
-    with zf.open(f"Fold {fold}/images/fold{fold}/types.npy") as tf:
-        _, _, dtype = _read_npy_header(tf)
-        types = np.frombuffer(tf.read(), dtype=dtype)
+    with _open_pannuke_zip(fold) as zf:
+        with zf.open(f"Fold {fold}/images/fold{fold}/types.npy") as tf:
+            _, _, dtype = _read_npy_header(tf)
+            types = np.frombuffer(tf.read(), dtype=dtype)
     return [str(t) for t in types]
 
 
@@ -253,17 +263,16 @@ def load_pannuke_samples(fold: int, n: int):
     reusing the same partial-DEFLATE-decompression trick so this never downloads the full
     ~700MB zip. Returns (images, gt_labels_list, tissue_labels); gt_labels_list is already
     in the standard label-mask format (see pannuke_mask_to_instance_labels)."""
-    zf = zipfile.ZipFile(fsspec.open(PANNUKE_FOLD_URL.format(fold=fold)).open())
+    with _open_pannuke_zip(fold) as zf:
+        with zf.open(f"Fold {fold}/images/fold{fold}/types.npy") as tf:
+            _, _, dtype = _read_npy_header(tf)
+            types = np.frombuffer(tf.read(n * dtype.itemsize), dtype=dtype)[:n]
 
-    with zf.open(f"Fold {fold}/images/fold{fold}/types.npy") as tf:
-        _, _, dtype = _read_npy_header(tf)
-        types = np.frombuffer(tf.read(n * dtype.itemsize), dtype=dtype)[:n]
+        raw, shape, dtype = _read_array_prefix(zf, f"Fold {fold}/images/fold{fold}/images.npy", n)
+        images = np.frombuffer(raw, dtype=dtype).reshape((n,) + shape[1:]).astype(np.uint8)
 
-    raw, shape, dtype = _read_array_prefix(zf, f"Fold {fold}/images/fold{fold}/images.npy", n)
-    images = np.frombuffer(raw, dtype=dtype).reshape((n,) + shape[1:]).astype(np.uint8)
-
-    raw, shape, dtype = _read_array_prefix(zf, f"Fold {fold}/masks/fold{fold}/masks.npy", n)
-    masks = np.frombuffer(raw, dtype=dtype).reshape((n,) + shape[1:])
+        raw, shape, dtype = _read_array_prefix(zf, f"Fold {fold}/masks/fold{fold}/masks.npy", n)
+        masks = np.frombuffer(raw, dtype=dtype).reshape((n,) + shape[1:])
 
     gt_labels_list = [pannuke_mask_to_instance_labels(masks[i]) for i in range(n)]
     return images, gt_labels_list, [str(t) for t in types]
@@ -413,8 +422,13 @@ def evaluate_result(
             ],
         }],
     )
-    text = next(b.text for b in response.content if b.type == "text")
-    return json.loads(text)
+    text_blocks = [b.text for b in response.content if b.type == "text"]
+    if not text_blocks:
+        raise RuntimeError(
+            f"Claude returned no text content (stop_reason={response.stop_reason!r}); "
+            "cannot parse a threshold-revision suggestion."
+        )
+    return json.loads(text_blocks[0])
 
 
 ACCEPT_PQ_THRESHOLD = 0.5
@@ -836,7 +850,7 @@ def main():
     args = parser.parse_args()
     if args.max_iterations < 1:
         parser.error("--max-iterations must be at least 1")
-    if not args.image and not args.pannuke_n and args.pannuke_index is None and not args.pannuke_loop_n:
+    if not args.image and args.pannuke_n is None and args.pannuke_index is None and args.pannuke_loop_n is None:
         parser.error("one of --image, --pannuke-n, --pannuke-index, or --pannuke-loop-n is required")
 
     output_dir = Path(args.output_dir)
@@ -876,7 +890,7 @@ def main():
         print(f"History: {json.dumps(history, indent=2)}")
         return
 
-    if args.pannuke_loop_n:
+    if args.pannuke_loop_n is not None:
         claude = anthropic.Anthropic() if args.claude_feedback else None
         if args.diverse_tissues:
             print(f"Fetching tissue-type layout for PanNuke fold {args.pannuke_fold}...")
@@ -933,7 +947,7 @@ def main():
         print(f"PDF report saved: {pdf_path}")
         return
 
-    if args.pannuke_n:
+    if args.pannuke_n is not None:
         print(f"Fetching {args.pannuke_n} images from PanNuke fold {args.pannuke_fold}...")
         images, tissue_labels = load_pannuke_images(args.pannuke_fold, args.pannuke_n)
 

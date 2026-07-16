@@ -121,12 +121,22 @@ class QwenVLM:
         trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
         return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
 
-    def ask_json(self, image_path: str, prompt: str, max_new_tokens: int = 512) -> dict:
+    def ask_json(self, image_path: str, prompt: str, max_new_tokens: int = 512, required_keys: list = None) -> dict:
+        """Unlike the Claude calls in agentic_countgd.py/agentic_stardist.py, Qwen has no
+        API-enforced JSON schema, so its free-text output can drop a requested key. Callers
+        that will subscript the result (e.g. result["score"]) should pass required_keys so a
+        malformed response fails here with a clear message instead of a bare KeyError deep in
+        the caller."""
         raw = self.ask(image_path, prompt, max_new_tokens=max_new_tokens)
         start, end = raw.find("{"), raw.rfind("}")
         if start == -1 or end == -1:
             raise ValueError(f"Qwen response did not contain a JSON object: {raw!r}")
-        return json.loads(raw[start:end + 1])
+        result = json.loads(raw[start:end + 1])
+        if required_keys:
+            missing = [k for k in required_keys if k not in result]
+            if missing:
+                raise ValueError(f"Qwen JSON response is missing required key(s) {missing}: {result!r}")
+        return result
 
 
 def select_agent(qwen: QwenVLM, task_description: str, image_path: str) -> str:
@@ -170,13 +180,13 @@ def evaluate_countgd_visual(
         "(1) do the boxes look visually accurate (no obvious double-counts, missed objects, "
         "or false positives)? (2) is the count plausible? (3) does this satisfy the user's "
         "original request?\n"
-        "Score 0-10. If score < 7 and a different/more specific text prompt would plausibly "
-        "fix it, set accept=false and give revised_text to retry with. Otherwise set "
-        "accept=true and revised_text=null.\n\n"
+        f"Score 0-10. If score < {ACCEPT_SCORE_THRESHOLD} and a different/more specific text "
+        "prompt would plausibly fix it, set accept=false and give revised_text to retry with. "
+        "Otherwise set accept=true and revised_text=null.\n\n"
         "Reply with ONLY a JSON object matching this schema: "
         "{\"accept\": bool, \"score\": int, \"feedback\": str, \"revised_text\": str or null}"
     )
-    return qwen.ask_json(annotated_image_path, prompt)
+    return qwen.ask_json(annotated_image_path, prompt, required_keys=["accept", "score", "feedback"])
 
 
 def propose_countgd_revision(
@@ -198,7 +208,7 @@ def propose_countgd_revision(
         "far too high, the target may be matching background clutter or double-counting.\n\n"
         "Reply with ONLY a JSON object matching this schema: {\"revised_text\": str, \"feedback\": str}"
     )
-    return qwen.ask_json(annotated_image_path, prompt)
+    return qwen.ask_json(annotated_image_path, prompt, required_keys=["feedback"])
 
 
 def evaluate_stardist_visual(
@@ -216,16 +226,16 @@ def evaluate_stardist_visual(
         "(no obvious missed nuclei, false positives, or merged/split instances)? (2) is the "
         "nucleus count plausible for what's shown? (3) does this satisfy the user's original "
         "request?\n"
-        "Score 0-10. If score < 7, propose revised threshold(s): raise prob_thresh if you see "
-        "false-positive outlines on background/noise, lower it if real nuclei look missed; "
-        "lower nms_thresh if you see duplicate/split outlines around one nucleus, raise it if "
-        "adjacent distinct nuclei look merged into one outline. Only set the threshold(s) that "
-        "address the problem -- leave the other null. Otherwise set accept=true and leave both "
-        "revised fields null.\n\n"
+        f"Score 0-10. If score < {ACCEPT_SCORE_THRESHOLD}, propose revised threshold(s): raise "
+        "prob_thresh if you see false-positive outlines on background/noise, lower it if real "
+        "nuclei look missed; lower nms_thresh if you see duplicate/split outlines around one "
+        "nucleus, raise it if adjacent distinct nuclei look merged into one outline. Only set "
+        "the threshold(s) that address the problem -- leave the other null. Otherwise set "
+        "accept=true and leave both revised fields null.\n\n"
         "Reply with ONLY a JSON object matching this schema: {\"accept\": bool, \"score\": int, "
         "\"feedback\": str, \"revised_prob_thresh\": number or null, \"revised_nms_thresh\": number or null}"
     )
-    return qwen.ask_json(outlines_image_path, prompt)
+    return qwen.ask_json(outlines_image_path, prompt, required_keys=["accept", "score", "feedback"])
 
 
 def propose_stardist_revision(
@@ -254,7 +264,7 @@ def propose_stardist_revision(
         "Reply with ONLY a JSON object matching this schema: "
         "{\"revised_prob_thresh\": number or null, \"revised_nms_thresh\": number or null, \"feedback\": str}"
     )
-    return qwen.ask_json(outlines_image_path, prompt)
+    return qwen.ask_json(outlines_image_path, prompt, required_keys=["feedback"])
 
 
 def run_countgd_with_feedback(
