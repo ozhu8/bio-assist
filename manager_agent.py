@@ -54,14 +54,15 @@ import argparse
 import json
 from pathlib import Path
 
-import numpy as np
-from gradio_client import Client
-from PIL import Image
-from stardist.models import StarDist2D
+import numpy as np # pyright: ignore[reportMissingImports]
+from gradio_client import Client # pyright: ignore[reportMissingImports]
+from PIL import Image # pyright: ignore[reportMissingImports]
+from stardist.models import StarDist2D # pyright: ignore[reportMissingImports]
 
 from agentic_countgd import COUNTGD_SPACE, run_countgd
 from agentic_stardist import (
     PRETRAINED_MODEL,
+    best_entry,
     compute_panoptic_quality,
     load_image,
     load_pannuke_sample,
@@ -92,7 +93,7 @@ class QwenVLM:
 
     def _load(self):
         if self._model is None:
-            from transformers import AutoModelForImageTextToText, AutoProcessor
+            from transformers import AutoModelForImageTextToText, AutoProcessor # pyright: ignore[reportMissingImports]
             self._model = AutoModelForImageTextToText.from_pretrained(
                 self.model_id, dtype="auto", device_map=self.device_map
             )
@@ -100,7 +101,7 @@ class QwenVLM:
         return self._model, self._processor
 
     def ask(self, image_path: str, prompt: str, max_new_tokens: int = 512) -> str:
-        from qwen_vl_utils import process_vision_info
+        from qwen_vl_utils import process_vision_info # pyright: ignore[reportMissingImports]
         model, processor = self._load()
 
         messages = [{
@@ -372,6 +373,17 @@ def run_stardist_with_feedback(
             prob_thresh = revised_prob
         if revised_nms is not None:
             nms_thresh = revised_nms
+
+    if ground_truth_labels is not None:
+        best = best_entry(history)
+        if best["iteration"] != history[-1]["iteration"]:
+            print(
+                f"  search continued past its best result -- reverting to iteration "
+                f"{best['iteration']} (PQ={best['pq']:.3f}) instead of the last one tried "
+                f"(PQ={history[-1]['pq']:.3f})"
+            )
+            labels, _ = run_stardist(model, image, prob_thresh=best["prob_thresh"], nms_thresh=best["nms_thresh"])
+            saved_path = output_dir / f"stardist_iteration_{best['iteration']}.png"
 
     return {
         "agent": "stardist", "num_nuclei": int(labels.max()), "labels": labels,

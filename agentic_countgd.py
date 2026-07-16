@@ -225,6 +225,8 @@ def main():
     parser.add_argument("--output-dir", default="./countgd_agent_output")
     parser.add_argument("--pdf-name", default=PDF_NAME, help="Filename for the saved PDF report")
     args = parser.parse_args()
+    if args.max_iterations < 1:
+        parser.error("--max-iterations must be at least 1")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
