@@ -32,14 +32,17 @@ explicitly or you'll get `RuntimeError: Please install TensorFlow`.
 ### `.venv-btrack` -- for `agentic_btrack.py`
 ```
 python -m venv .venv-btrack
-.venv-btrack/Scripts/pip install anthropic matplotlib pillow numpy scikit-image tifffile btrack stardist csbdeep tensorflow fsspec aiohttp
+.venv-btrack/Scripts/pip install anthropic matplotlib pillow numpy scikit-image tifffile imagecodecs btrack stardist csbdeep tensorflow fsspec aiohttp
 ```
 Needs `stardist`/`csbdeep`/`tensorflow` for the same reason `manager_agent.py` does
 (same gotcha as above): it imports `run_stardist` from `agentic_stardist.py` at
 module load time, to segment each frame before btrack links them across time --
 and since that pulls in all of `agentic_stardist.py`'s own imports too, it also
 needs `fsspec`/`aiohttp` (the PanNuke partial-read deps `agentic_stardist.py`
-uses) even though `agentic_btrack.py` itself never touches PanNuke.
+uses) even though `agentic_btrack.py` itself never touches PanNuke. Needs
+`imagecodecs` too -- Cell Tracking Challenge's raw/GT TIFFs are LZW-compressed,
+and `tifffile.imread` raises `ValueError: <COMPRESSION.LZW: 5> requires the
+'imagecodecs' package` without it.
 
 **On Apple Silicon, build this venv with a native arm64 Python, not an
 Intel/x86_64 one.** `python -m venv` on macOS uses whatever `python`/`python3`
@@ -62,10 +65,58 @@ by adding an explicit `import btrack.datasets` alongside `import btrack`.
 Verified end-to-end 2026-07-17: `--images-dir` against a synthetic 6-frame/
 5-blob sequence (generated locally, not part of the repo) correctly produced 5
 tracks whose plotted trajectories matched each blob's actual direction of
-motion, plus a PDF report and `.h5` tracks file. The `--ctc-dataset` ground-truth
-retry loop (`compute_link_accuracy`/`propose_search_radius`) has not been
-exercised yet -- that needs a real CTC dataset download, which wasn't run this
-session.
+motion, plus a PDF report and `.h5` tracks file.
+
+**`PyTrackObject.label` is NOT the source segmentation's per-frame instance/region
+ID, despite the name** -- it's a classification *state* field that defaults to
+`constants.States.NULL` for every object unless `segmentation_to_objects` is
+called with `assign_class_ID=True`. Every object came back with the identical
+`label` value regardless of which region it was built from -- confirmed by direct
+inspection (`obj.label` was `5` for all 130 objects across 3 frames of visibly
+different regions). This silently broke the (frame, label) -> btrack track ID
+mapping `agentic_btrack.py`'s ground-truth scoring depends on (`pred_track_id_map`
+had 2 entries instead of 86). Fixed in `track_sequence` by reconstructing each
+object's original label from its 1-indexed position among objects sharing its
+frame instead -- valid because `segmentation_to_objects` processes frames
+strictly in order (single worker by default) and regionprops visits labels in
+ascending order with no gaps (StarDist's own convention).
+
+**Even with that fixed, `--ctc-dataset` tracking accuracy against ground truth is
+currently bad (link_accuracy ~0), and it's NOT a script bug -- `max_search_radius`
+does not act as a hard cutoff on link distance.** Tested directly against 3 frames
+of `Fluo-N2DL-HeLa` (true same-cell displacement ~1-2px there): `max_search_radius=5`
+and `max_search_radius=100` produced near-identical results -- same 43 links, same
+973.8px maximum link distance, same ~370px mean. Whatever's actually gating which
+objects get linked together is coming from elsewhere in `cell_config.json` (most
+likely the motion model's own process/measurement noise parameters), not the
+`max_search_radius` knob `agentic_btrack.py`'s retry loop (`propose_search_radius`)
+is built around -- so as currently written, that retry loop will not converge to
+good tracking on this dataset no matter how many iterations it runs, since it's
+tuning a parameter that isn't the actual lever. **Paused here, not fixed**: the
+real fix would mean investigating/retuning `cell_config.json`'s motion-model noise
+parameters directly (its example config is presumably tuned for a reference
+dataset with a very different displacement scale than this one), which is a
+larger, more open-ended task than the mapping bug above. `imagecodecs` had to be
+added too (see the install command above) to read Cell Tracking Challenge's
+LZW-compressed TIFFs.
+
+**On this Windows/OneDrive checkout specifically**, built at
+`C:\Users\hanna\venvs\bio-assist\.venv-btrack` instead of `.venv-btrack` in the
+repo root like the others -- deliberately outside the OneDrive-synced folder, to
+avoid repeating the quota problem noted above (`tensorflow` alone is well over
+500MB). Run scripts by pointing at that interpreter directly from the repo root,
+e.g. `"C:\Users\hanna\venvs\bio-assist\.venv-btrack\Scripts\python" agentic_btrack.py ...`
+Worth doing the same for the other three venvs next time they need recreating.
+Also hit, and worked around without any system changes: `StarDist2D.from_pretrained`
+tries to `symlink_to` its extracted model cache (`csbdeep`'s `get_model_folder`,
+keras >= 3.6.0 codepath) and Windows requires either admin rights or Developer
+Mode for unprivileged symlinks -- `OSError: [WinError 1314] A required privilege
+is not held by the client`. Since the target content is already sitting right
+there under the `*_extracted` suffix, a plain recursive copy to the non-suffixed
+name (`cp -r ..._extracted ...` with the suffix stripped, under
+`~/.keras/models/StarDist2D/<model>/`) satisfies the `path_folder.exists()` check
+csbdeep does before attempting the symlink, so it's never attempted at all on
+subsequent runs.
 
 ### `.venv-manager` -- for `manager_agent.py` (Qwen3-VL manager)
 ```
