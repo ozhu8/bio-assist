@@ -20,6 +20,7 @@ training loop imports, the same way it imports agentic_stardist.py's PanNuke fet
 import re
 import zipfile
 from pathlib import Path
+from typing import Any, cast
 
 import fsspec # pyright: ignore[reportMissingImports]
 import numpy as np # pyright: ignore[reportMissingImports]
@@ -32,7 +33,8 @@ _FILENAME_RE = re.compile(
 
 
 def _open_bbbc005_zip() -> zipfile.ZipFile:
-    return zipfile.ZipFile(fsspec.open(BBBC005_IMAGES_URL).open())
+    open_file = cast(Any, fsspec.open(BBBC005_IMAGES_URL))
+    return zipfile.ZipFile(open_file.open())
 
 
 def list_bbbc005_members(zf: zipfile.ZipFile, blur: int = 1, stain: int = 1) -> list:

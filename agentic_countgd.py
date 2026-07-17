@@ -14,8 +14,10 @@ import json
 import mimetypes
 import textwrap
 from pathlib import Path
+from typing import Any, Optional, cast
 
 import anthropic # pyright: ignore[reportMissingImports]
+from anthropic.types import ImageBlockParam # pyright: ignore[reportMissingImports]
 import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
 from matplotlib.backends.backend_pdf import PdfPages # pyright: ignore[reportMissingModuleSource]
 from PIL import Image # pyright: ignore[reportMissingImports]
@@ -26,18 +28,18 @@ COUNTGD_SPACE = "nikigoli/countgd"
 PDF_NAME = "countgd_results.pdf"
 
 
-def image_to_content_block(image_path: str) -> dict:
+def image_to_content_block(image_path: str) -> ImageBlockParam:
     mime_type, _ = mimetypes.guess_type(image_path)
     if mime_type is None:
         mime_type = "image/png"
     data = base64.standard_b64encode(Path(image_path).read_bytes()).decode("utf-8")
-    return {
+    return cast(ImageBlockParam, {
         "type": "image",
         "source": {"type": "base64", "media_type": mime_type, "data": data},
-    }
+    })
 
 
-def unwrap(value):
+def unwrap(value: Any) -> Any:
     """Gradio event-driven outputs arrive as {'value': ..., '__type__': 'update'} dicts."""
     return value["value"] if isinstance(value, dict) and "value" in value else value
 
@@ -160,7 +162,7 @@ def save_pdf_report(
     user_prompt: str,
     image_paths: list,
     history: list,
-    evaluator_note: str = None,
+    evaluator_note: Optional[str] = None,
 ) -> None:
     """Render a methodology page, then one page per iteration (annotated image + feedback), into a single PDF."""
     with PdfPages(pdf_path) as pdf:

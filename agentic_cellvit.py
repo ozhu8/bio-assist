@@ -34,8 +34,10 @@ import mimetypes
 import sys
 import textwrap
 from pathlib import Path
+from typing import Optional
 
 import anthropic # pyright: ignore[reportMissingImports]
+from anthropic.types import ImageBlockParam, TextBlockParam, Base64ImageSourceParam # pyright: ignore[reportMissingImports]
 import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
 import numpy as np # pyright: ignore[reportMissingImports]
 import torch # pyright: ignore[reportMissingImports]
@@ -65,15 +67,18 @@ def load_cellvit_module(cellvit_repo: str):
     return CellSegmentationInference, COLOR_DICT
 
 
-def image_to_content_block(image_path: str) -> dict:
+def image_to_content_block(image_path: str) -> ImageBlockParam:
     mime_type, _ = mimetypes.guess_type(image_path)
-    if mime_type is None:
+    # Map detected MIME type to one of the allowed literal values; default to image/png
+    allowed_types = ["image/jpeg", "image/png", "image/gif", "image/webp"]
+    if mime_type not in allowed_types:
         mime_type = "image/png"
     data = base64.standard_b64encode(Path(image_path).read_bytes()).decode("utf-8")
-    return {
-        "type": "image",
-        "source": {"type": "base64", "media_type": mime_type, "data": data},
-    }
+    source = Base64ImageSourceParam(type="base64", media_type=mime_type, data=data)  # type: ignore[arg-type]
+    return ImageBlockParam(
+        type="image",
+        source=source,
+    )
 
 
 def run_cellvit(inferer, image_path: str, magnification: float, target_classes: set, prob_threshold: float, color_dict: dict):
@@ -197,7 +202,7 @@ def interpret_request(claude: anthropic.Anthropic, user_prompt: str, image_path:
             "role": "user",
             "content": [
                 image_to_content_block(image_path),
-                {"type": "text", "text": (
+                TextBlockParam(type="text", text=(
                     "CellViT classifies nuclei in histopathology images into exactly five "
                     f"fixed classes: {', '.join(NUCLEI_CLASSES)}. The user wants: "
                     f"\"{user_prompt}\"\n\n"
@@ -207,7 +212,7 @@ def interpret_request(claude: anthropic.Anthropic, user_prompt: str, image_path:
                     "confidence threshold in [0, 1] for keeping a detection - 0.5 is a "
                     "reasonable default, raise it if the request implies only confident/obvious "
                     "cells and lower it if it implies catching everything."
-                )},
+                )),
             ],
         }],
     )
@@ -253,7 +258,7 @@ def evaluate_result(
             "role": "user",
             "content": [
                 image_to_content_block(annotated_image_path),
-                {"type": "text", "text": (
+                TextBlockParam(type="text", text=(
                     f"Original user request: \"{user_prompt}\"\n"
                     f"CellViT was asked to highlight: {target_classes} (type_prob >= {prob_threshold})\n"
                     f"Matched cell count: {predicted_count}\n"
@@ -270,7 +275,7 @@ def evaluate_result(
                     "plausibly fix it, set accept=false and give revised_target_classes and/or "
                     "revised_prob_threshold to retry with. Otherwise set accept=true and leave "
                     "both revised fields null."
-                )},
+                )),
             ],
         }],
     )
@@ -310,7 +315,7 @@ def save_pdf_report(
     user_prompt: str,
     image_paths: list,
     history: list,
-    evaluator_note: str = None,
+    evaluator_note: Optional[str] = None,
 ) -> None:
     """Render a methodology page, then one page per iteration (annotated image + feedback), into a single PDF."""
     with PdfPages(pdf_path) as pdf:
