@@ -29,6 +29,19 @@ python -m venv .venv-stardist
 at import time, not declared as a pip dependency, so it must be installed
 explicitly or you'll get `RuntimeError: Please install TensorFlow`.
 
+### `.venv-btrack` -- for `agentic_btrack.py`
+```
+python -m venv .venv-btrack
+.venv-btrack/Scripts/pip install anthropic matplotlib pillow numpy scikit-image tifffile btrack stardist csbdeep tensorflow
+```
+Needs `stardist`/`csbdeep`/`tensorflow` for the same reason `manager_agent.py` does
+(same gotcha as above): it imports `run_stardist` from `agentic_stardist.py` at
+module load time, to segment each frame before btrack links them across time.
+**Not yet verified end-to-end** (no venv has actually been created/run for this one
+yet -- the package list above is from reading btrack's own source/docs, not from a
+successful `pip install` + run in this repo). Verify it the first time you actually
+run the script and update this note.
+
 ### `.venv-manager` -- for `manager_agent.py` (Qwen3-VL manager)
 ```
 python -m venv .venv-manager
@@ -55,3 +68,13 @@ Verified end-to-end with `python -c "import manager_agent"` succeeding in
 - No API key is required to run `manager_agent.py` -- Qwen runs locally, CountGD is
   a public hosted Gradio Space. The `anthropic` package is still a required import
   (transitively, via `agentic_countgd.py`/`agentic_stardist.py`) but is never called.
+- `agentic_btrack.py` follows the same CountGD/StarDist shape but tracks cells across
+  a frame sequence instead of scoring one image: it reuses `run_stardist` from
+  `agentic_stardist.py` unchanged to segment each frame, then runs btrack to link
+  those per-frame instances into tracks. Ground truth comes from Cell Tracking
+  Challenge (celltrackingchallenge.net) training sequences instead of PanNuke, scored
+  with a simplified link-accuracy proxy (not the official CTC TRA/AOGM metric -- see
+  the script's docstring and `compute_link_accuracy`). The retry knob is btrack's
+  `max_search_radius`, the only easily-revisable parameter, rather than StarDist's
+  prob_thresh/nms_thresh pair. Written but not yet run end-to-end -- see the
+  `.venv-btrack` note above.
