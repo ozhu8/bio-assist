@@ -60,14 +60,15 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-import anthropic
-import btrack
-import matplotlib.pyplot as plt
-import numpy as np
-import tifffile
-from matplotlib.backends.backend_pdf import PdfPages
-from PIL import Image
-from stardist.models import StarDist2D
+import anthropic # pyright: ignore[reportMissingImports]
+import btrack # pyright: ignore[reportMissingImports]
+import btrack.datasets # pyright: ignore[reportMissingImports]
+import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
+import numpy as np # pyright: ignore[reportMissingImports]
+import tifffile # pyright: ignore[reportMissingImports]
+from matplotlib.backends.backend_pdf import PdfPages # pyright: ignore[reportMissingModuleSource]
+from PIL import Image # pyright: ignore[reportMissingImports]
+from stardist.models import StarDist2D # pyright: ignore[reportMissingImports]
 
 from agentic_stardist import run_stardist
 

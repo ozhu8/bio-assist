@@ -32,15 +32,40 @@ explicitly or you'll get `RuntimeError: Please install TensorFlow`.
 ### `.venv-btrack` -- for `agentic_btrack.py`
 ```
 python -m venv .venv-btrack
-.venv-btrack/Scripts/pip install anthropic matplotlib pillow numpy scikit-image tifffile btrack stardist csbdeep tensorflow
+.venv-btrack/Scripts/pip install anthropic matplotlib pillow numpy scikit-image tifffile btrack stardist csbdeep tensorflow fsspec aiohttp
 ```
 Needs `stardist`/`csbdeep`/`tensorflow` for the same reason `manager_agent.py` does
 (same gotcha as above): it imports `run_stardist` from `agentic_stardist.py` at
-module load time, to segment each frame before btrack links them across time.
-**Not yet verified end-to-end** (no venv has actually been created/run for this one
-yet -- the package list above is from reading btrack's own source/docs, not from a
-successful `pip install` + run in this repo). Verify it the first time you actually
-run the script and update this note.
+module load time, to segment each frame before btrack links them across time --
+and since that pulls in all of `agentic_stardist.py`'s own imports too, it also
+needs `fsspec`/`aiohttp` (the PanNuke partial-read deps `agentic_stardist.py`
+uses) even though `agentic_btrack.py` itself never touches PanNuke.
+
+**On Apple Silicon, build this venv with a native arm64 Python, not an
+Intel/x86_64 one.** `python -m venv` on macOS uses whatever `python`/`python3`
+resolves to on `PATH` -- if that happens to be an x86_64-only build (e.g. an old
+`/Library/Frameworks/Python.framework` install), every run goes through Rosetta
+2, and Rosetta's one-time ahead-of-time translation of TensorFlow's ~700MB
+`libtensorflow_cc.2.dylib` took 13+ minutes and then hung in an uninterruptible
+kernel wait (`ps` showed `UE` state, not even killable with `kill -9`) before
+this was caught. Check with `file $(which python3)` before creating the venv
+(want `arm64`, not `x86_64`); `/opt/anaconda3/bin/python3` was the arm64 option
+on this machine. Rebuilding the venv with that interpreter dropped the same
+import from 13+ minutes (hung) to ~4s warm / ~57s cold.
+
+**`import btrack` alone does not expose `btrack.datasets`** -- `btrack/__init__.py`
+(as of btrack 0.7.0) only imports `BayesianTracker`, not the `datasets`
+submodule, even though `btrack.datasets.cell_config()` (used to fetch the
+default tracker config) is real, documented API. Fixed in `agentic_btrack.py`
+by adding an explicit `import btrack.datasets` alongside `import btrack`.
+
+Verified end-to-end 2026-07-17: `--images-dir` against a synthetic 6-frame/
+5-blob sequence (generated locally, not part of the repo) correctly produced 5
+tracks whose plotted trajectories matched each blob's actual direction of
+motion, plus a PDF report and `.h5` tracks file. The `--ctc-dataset` ground-truth
+retry loop (`compute_link_accuracy`/`propose_search_radius`) has not been
+exercised yet -- that needs a real CTC dataset download, which wasn't run this
+session.
 
 ### `.venv-manager` -- for `manager_agent.py` (Qwen3-VL manager)
 ```
