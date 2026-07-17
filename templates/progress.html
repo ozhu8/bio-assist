@@ -22,10 +22,14 @@
 
 <div id="progress-error" class="flash" hidden></div>
 
+<script id="progress-config" type="application/json">
+  {{ {"run_id": run_id, "back_url": back_url} | tojson }}
+</script>
 <script>
   (function () {
-    var runId = {{ run_id | tojson }};
-    var backUrl = {{ back_url | tojson }};
+    var config = JSON.parse(document.getElementById("progress-config").textContent);
+    var runId = config.run_id;
+    var backUrl = config.back_url;
     var fill = document.getElementById("progress-fill");
     var percent = document.getElementById("progress-percent");
     var elapsedEl = document.getElementById("progress-elapsed");

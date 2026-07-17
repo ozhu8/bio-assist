@@ -34,6 +34,14 @@ imports their run_countgd/run_stardist/compute_panoptic_quality (and
 StarDist's save_instance_outlines/load_pannuke_sample) and drives them with
 Qwen instead of Claude.
 
+StarDist's calls run in a spawned subprocess (StardistWorker, below) rather than
+being imported directly into this process. Reason: `agentic_stardist.py` imports
+`stardist.models`, which imports TensorFlow -- and TensorFlow bundles its own LLVM
+(for XLA), which collides with ROCm/Triton's bundled LLVM the moment this process
+also runs a GPU torch kernel (`LLVM ERROR: inconsistency in registered CommandLine
+options`, a hard process abort). This only surfaces once torch actually touches a
+GPU -- see the ROCm section below -- so it stayed invisible while this ran CPU-only.
+
 Setup (needs its own venv -- these are not installed in .venv-countgd/
 .venv-stardist):
     pip install torch transformers accelerate qwen-vl-utils pillow
@@ -52,22 +60,15 @@ Usage:
 """
 import argparse
 import json
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-import numpy as np
-from gradio_client import Client
-from PIL import Image
-from stardist.models import StarDist2D
+import numpy as np # pyright: ignore[reportMissingImports]
+from gradio_client import Client # pyright: ignore[reportMissingImports]
+from PIL import Image # pyright: ignore[reportMissingImports]
 
 from agentic_countgd import COUNTGD_SPACE, run_countgd
-from agentic_stardist import (
-    PRETRAINED_MODEL,
-    compute_panoptic_quality,
-    load_image,
-    load_pannuke_sample,
-    run_stardist,
-    save_instance_outlines,
-)
 
 MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 ACCEPT_SCORE_THRESHOLD = 7  # Qwen's own 0-10 visual score, used when there's no ground truth to measure against
@@ -92,7 +93,7 @@ class QwenVLM:
 
     def _load(self):
         if self._model is None:
-            from transformers import AutoModelForImageTextToText, AutoProcessor
+            from transformers import AutoModelForImageTextToText, AutoProcessor # pyright: ignore[reportMissingImports]
             self._model = AutoModelForImageTextToText.from_pretrained(
                 self.model_id, dtype="auto", device_map=self.device_map
             )
@@ -100,7 +101,7 @@ class QwenVLM:
         return self._model, self._processor
 
     def ask(self, image_path: str, prompt: str, max_new_tokens: int = 512) -> str:
-        from qwen_vl_utils import process_vision_info
+        from qwen_vl_utils import process_vision_info # pyright: ignore[reportMissingImports]
         model, processor = self._load()
 
         messages = [{
@@ -120,12 +121,34 @@ class QwenVLM:
         trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
         return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
 
-    def ask_json(self, image_path: str, prompt: str, max_new_tokens: int = 512) -> dict:
+    def ask_json(self, image_path: str, prompt: str, max_new_tokens: int = 512, required_keys: list = None) -> dict:
+        """Unlike the Claude calls in agentic_countgd.py/agentic_stardist.py, Qwen has no
+        API-enforced JSON schema, so its free-text output can drop a requested key. Callers
+        that will subscript the result (e.g. result["score"]) should pass required_keys so a
+        malformed response fails here with a clear message instead of a bare KeyError deep in
+        the caller."""
         raw = self.ask(image_path, prompt, max_new_tokens=max_new_tokens)
         start, end = raw.find("{"), raw.rfind("}")
         if start == -1 or end == -1:
             raise ValueError(f"Qwen response did not contain a JSON object: {raw!r}")
-        return json.loads(raw[start:end + 1])
+        result = json.loads(raw[start:end + 1])
+        if required_keys:
+            missing = [k for k in required_keys if k not in result]
+            if missing:
+                raise ValueError(f"Qwen JSON response is missing required key(s) {missing}: {result!r}")
+        return result
+
+    def ask_text(self, prompt: str, max_new_tokens: int = 512) -> str:
+        """Text-only turn, no image -- for prompts that summarize patterns across multiple
+        images/notes rather than looking at any one of them (see train_manager.py)."""
+        model, processor = self._load()
+        messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+        chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=[chat_text], padding=True, return_tensors="pt").to(model.device)
+
+        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
+        return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
 
 
 def select_agent(qwen: QwenVLM, task_description: str, image_path: str) -> str:
@@ -169,13 +192,13 @@ def evaluate_countgd_visual(
         "(1) do the boxes look visually accurate (no obvious double-counts, missed objects, "
         "or false positives)? (2) is the count plausible? (3) does this satisfy the user's "
         "original request?\n"
-        "Score 0-10. If score < 7 and a different/more specific text prompt would plausibly "
-        "fix it, set accept=false and give revised_text to retry with. Otherwise set "
-        "accept=true and revised_text=null.\n\n"
+        f"Score 0-10. If score < {ACCEPT_SCORE_THRESHOLD} and a different/more specific text "
+        "prompt would plausibly fix it, set accept=false and give revised_text to retry with. "
+        "Otherwise set accept=true and revised_text=null.\n\n"
         "Reply with ONLY a JSON object matching this schema: "
         "{\"accept\": bool, \"score\": int, \"feedback\": str, \"revised_text\": str or null}"
     )
-    return qwen.ask_json(annotated_image_path, prompt)
+    return qwen.ask_json(annotated_image_path, prompt, required_keys=["accept", "score", "feedback"])
 
 
 def propose_countgd_revision(
@@ -197,7 +220,7 @@ def propose_countgd_revision(
         "far too high, the target may be matching background clutter or double-counting.\n\n"
         "Reply with ONLY a JSON object matching this schema: {\"revised_text\": str, \"feedback\": str}"
     )
-    return qwen.ask_json(annotated_image_path, prompt)
+    return qwen.ask_json(annotated_image_path, prompt, required_keys=["feedback"])
 
 
 def evaluate_stardist_visual(
@@ -215,16 +238,16 @@ def evaluate_stardist_visual(
         "(no obvious missed nuclei, false positives, or merged/split instances)? (2) is the "
         "nucleus count plausible for what's shown? (3) does this satisfy the user's original "
         "request?\n"
-        "Score 0-10. If score < 7, propose revised threshold(s): raise prob_thresh if you see "
-        "false-positive outlines on background/noise, lower it if real nuclei look missed; "
-        "lower nms_thresh if you see duplicate/split outlines around one nucleus, raise it if "
-        "adjacent distinct nuclei look merged into one outline. Only set the threshold(s) that "
-        "address the problem -- leave the other null. Otherwise set accept=true and leave both "
-        "revised fields null.\n\n"
+        f"Score 0-10. If score < {ACCEPT_SCORE_THRESHOLD}, propose revised threshold(s): raise "
+        "prob_thresh if you see false-positive outlines on background/noise, lower it if real "
+        "nuclei look missed; lower nms_thresh if you see duplicate/split outlines around one "
+        "nucleus, raise it if adjacent distinct nuclei look merged into one outline. Only set "
+        "the threshold(s) that address the problem -- leave the other null. Otherwise set "
+        "accept=true and leave both revised fields null.\n\n"
         "Reply with ONLY a JSON object matching this schema: {\"accept\": bool, \"score\": int, "
         "\"feedback\": str, \"revised_prob_thresh\": number or null, \"revised_nms_thresh\": number or null}"
     )
-    return qwen.ask_json(outlines_image_path, prompt)
+    return qwen.ask_json(outlines_image_path, prompt, required_keys=["accept", "score", "feedback"])
 
 
 def propose_stardist_revision(
@@ -253,7 +276,7 @@ def propose_stardist_revision(
         "Reply with ONLY a JSON object matching this schema: "
         "{\"revised_prob_thresh\": number or null, \"revised_nms_thresh\": number or null, \"feedback\": str}"
     )
-    return qwen.ask_json(outlines_image_path, prompt)
+    return qwen.ask_json(outlines_image_path, prompt, required_keys=["feedback"])
 
 
 def run_countgd_with_feedback(
@@ -312,8 +335,80 @@ def run_countgd_with_feedback(
     }
 
 
+_worker_model = None  # set inside the spawned StarDist subprocess only -- stays None in this process
+
+
+def _stardist_worker_init(image_path: str):
+    """Runs inside the spawned subprocess. Loads (and caches) the StarDist model and the image."""
+    global _worker_model
+    from agentic_stardist import PRETRAINED_MODEL, load_image
+    from stardist.models import StarDist2D # pyright: ignore[reportMissingImports]
+    if _worker_model is None:
+        _worker_model = StarDist2D.from_pretrained(PRETRAINED_MODEL)
+    image = load_image(image_path)
+    return image, round(_worker_model.thresholds.prob, 3), round(_worker_model.thresholds.nms, 3)
+
+
+def _stardist_worker_run(image: np.ndarray, prob_thresh: float, nms_thresh: float,
+                          gt_labels: np.ndarray, outlines_path: Path) -> dict:
+    """Runs inside the spawned subprocess. Assumes _stardist_worker_init already ran in this
+    same worker process (ProcessPoolExecutor(max_workers=1) reuses one process for every task)."""
+    from agentic_stardist import compute_panoptic_quality, run_stardist, save_instance_outlines
+    labels, _ = run_stardist(_worker_model, image, prob_thresh=prob_thresh, nms_thresh=nms_thresh)
+    save_instance_outlines(image, labels, outlines_path)
+    pq_result = compute_panoptic_quality(labels, gt_labels) if gt_labels is not None else None
+    return {"labels": labels, "pq_result": pq_result}
+
+
+def _stardist_worker_load_pannuke(fold: int, index: int):
+    """Runs inside the spawned subprocess (load_pannuke_sample lives in agentic_stardist.py too)."""
+    from agentic_stardist import load_pannuke_sample
+    return load_pannuke_sample(fold, index)
+
+
+def _stardist_worker_revert_to_best(image: np.ndarray, history: list, outlines_path: Path):
+    """Runs inside the spawned subprocess. best_entry is pure logic (max(history, key=pq)) but
+    lives in agentic_stardist.py, so it still needs to run in here rather than the parent --
+    see the module docstring. Returns None if the last iteration tried was already the best."""
+    from agentic_stardist import best_entry, run_stardist, save_instance_outlines
+    best = best_entry(history)
+    if best["iteration"] == history[-1]["iteration"]:
+        return None
+    labels, _ = run_stardist(_worker_model, image, prob_thresh=best["prob_thresh"], nms_thresh=best["nms_thresh"])
+    save_instance_outlines(image, labels, outlines_path)
+    return {"labels": labels, "best_iteration": best["iteration"], "best_pq": best["pq"]}
+
+
+class StardistWorker:
+    """Owns a single persistent spawned subprocess that all StarDist calls are routed through --
+    see the module docstring for why StarDist/TensorFlow can't share a process with torch/ROCm.
+    `spawn` (not the Linux default `fork`) is required: fork would duplicate this process's
+    already-loaded ROCm/Triton state into the child, reintroducing the exact conflict."""
+
+    def __init__(self):
+        self._pool = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+
+    def init(self, image_path: str):
+        return self._pool.submit(_stardist_worker_init, image_path).result()
+
+    def run(self, image: np.ndarray, prob_thresh: float, nms_thresh: float,
+            gt_labels: np.ndarray, outlines_path: Path) -> dict:
+        return self._pool.submit(
+            _stardist_worker_run, image, prob_thresh, nms_thresh, gt_labels, outlines_path
+        ).result()
+
+    def load_pannuke_sample(self, fold: int, index: int):
+        return self._pool.submit(_stardist_worker_load_pannuke, fold, index).result()
+
+    def revert_to_best(self, image: np.ndarray, history: list, outlines_path: Path):
+        return self._pool.submit(_stardist_worker_revert_to_best, image, history, outlines_path).result()
+
+    def shutdown(self):
+        self._pool.shutdown(wait=True)
+
+
 def run_stardist_with_feedback(
-    qwen: QwenVLM, model: StarDist2D, image_path: str, task_description: str,
+    qwen: QwenVLM, worker: StardistWorker, image_path: str, task_description: str,
     max_iterations: int, output_dir: Path, ground_truth_labels: np.ndarray = None,
 ) -> dict:
     """If ground_truth_labels is given (a PanNuke-style instance mask), Panoptic Quality against
@@ -321,22 +416,21 @@ def run_stardist_with_feedback(
     Qwen only proposes revised thresholds (propose_stardist_revision). Otherwise there's no ground
     truth to compute PQ against, so Qwen scores the result visually and decides accept/reject itself
     (evaluate_stardist_visual)."""
-    image = load_image(image_path)
-    prob_thresh, nms_thresh = round(model.thresholds.prob, 3), round(model.thresholds.nms, 3)
+    image, prob_thresh, nms_thresh = worker.init(image_path)
 
     history = []
     saved_path = None
     labels = None
     for i in range(1, max_iterations + 1):
         print(f"--- Iteration {i}: StarDist prob_thresh={prob_thresh:.3f}, nms_thresh={nms_thresh:.3f} ---")
-        labels, _ = run_stardist(model, image, prob_thresh=prob_thresh, nms_thresh=nms_thresh)
-        predicted_count = int(labels.max())
         saved_path = output_dir / f"stardist_iteration_{i}.png"
-        save_instance_outlines(image, labels, saved_path)
+        result = worker.run(image, prob_thresh, nms_thresh, ground_truth_labels, saved_path)
+        labels = result["labels"]
+        predicted_count = int(labels.max())
         print(f"[StarDist] nuclei={predicted_count}")
 
         if ground_truth_labels is not None:
-            pq_result = compute_panoptic_quality(labels, ground_truth_labels)
+            pq_result = result["pq_result"]
             accept = pq_result["pq"] >= ACCEPT_PQ_THRESHOLD
             if accept:
                 feedback, revised_prob, revised_nms = "PQ met the acceptance threshold.", None, None
@@ -373,6 +467,17 @@ def run_stardist_with_feedback(
         if revised_nms is not None:
             nms_thresh = revised_nms
 
+    if ground_truth_labels is not None:
+        revert = worker.revert_to_best(image, history, output_dir / "stardist_best.png")
+        if revert is not None:
+            print(
+                f"  search continued past its best result -- reverting to iteration "
+                f"{revert['best_iteration']} (PQ={revert['best_pq']:.3f}) instead of the last one "
+                f"tried (PQ={history[-1]['pq']:.3f})"
+            )
+            labels = revert["labels"]
+            saved_path = output_dir / "stardist_best.png"
+
     return {
         "agent": "stardist", "num_nuclei": int(labels.max()), "labels": labels,
         "outlines_image": saved_path, "history": history,
@@ -386,7 +491,7 @@ class ManagerAgent:
     def __init__(self, model_id: str = MODEL_ID):
         self.qwen = QwenVLM(model_id)
         self._countgd_client = None
-        self._stardist_model = None
+        self._stardist_worker = None
 
     @property
     def countgd_client(self) -> Client:
@@ -395,10 +500,10 @@ class ManagerAgent:
         return self._countgd_client
 
     @property
-    def stardist_model(self) -> StarDist2D:
-        if self._stardist_model is None:
-            self._stardist_model = StarDist2D.from_pretrained(PRETRAINED_MODEL)
-        return self._stardist_model
+    def stardist_worker(self) -> StardistWorker:
+        if self._stardist_worker is None:
+            self._stardist_worker = StardistWorker()
+        return self._stardist_worker
 
     def run(
         self, task_description: str, image_path: str, max_iterations: int = 3,
@@ -420,7 +525,7 @@ class ManagerAgent:
                 ground_truth_count=ground_truth_count,
             )
         return run_stardist_with_feedback(
-            self.qwen, self.stardist_model, image_path, task_description, max_iterations, out_dir,
+            self.qwen, self.stardist_worker, image_path, task_description, max_iterations, out_dir,
             ground_truth_labels=ground_truth_labels,
         )
 
@@ -455,18 +560,21 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    manager = ManagerAgent(model_id=args.model_id)
+
     image_path = args.image
     ground_truth_labels = None
     if args.pannuke_index is not None:
         print(f"Fetching PanNuke fold {args.pannuke_fold} image {args.pannuke_index}...")
-        image, ground_truth_labels, tissue = load_pannuke_sample(args.pannuke_fold, args.pannuke_index)
+        image, ground_truth_labels, tissue = manager.stardist_worker.load_pannuke_sample(
+            args.pannuke_fold, args.pannuke_index
+        )
         print(f"tissue={tissue}  ground-truth nuclei={int(ground_truth_labels.max())}")
         image_path = str(output_dir / f"pannuke_fold{args.pannuke_fold}_{args.pannuke_index:02d}.png")
         Image.fromarray(image).save(image_path)
     elif args.ground_truth_labels is not None:
         ground_truth_labels = np.load(args.ground_truth_labels)
 
-    manager = ManagerAgent(model_id=args.model_id)
     result = manager.run(
         args.task, image_path, args.max_iterations, args.output_dir,
         ground_truth_count=args.ground_truth_count, ground_truth_labels=ground_truth_labels,

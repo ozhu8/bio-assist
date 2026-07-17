@@ -18,7 +18,7 @@ state is lost on restart and never evicted.
 
 Run with: python app.py
 """
-import mimetypes
+import mimetypes 
 import os
 import threading
 import uuid
@@ -30,18 +30,18 @@ from pathlib import Path
 # touched from a background thread — and the pipeline now always runs in one.
 # "Agg" is the correct non-interactive backend anyway since we only ever
 # write PDFs to disk, never show a window.
-import matplotlib
+import matplotlib # pyright: ignore[reportMissingModuleSource]
 matplotlib.use("Agg")
 
-import anthropic
-import matplotlib.pyplot as plt
-import numpy as np
-from flask import Flask, flash, jsonify, redirect, render_template, request, send_file, url_for
-from gradio_client import Client
-from matplotlib.backends.backend_pdf import PdfPages
-from PIL import Image
-from scipy import ndimage
-from skimage.feature import peak_local_max
+import anthropic # pyright: ignore[reportMissingImports]
+import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
+import numpy as np # pyright: ignore[reportMissingImports]
+from flask import Flask, flash, jsonify, redirect, render_template, request, send_file, url_for # pyright: ignore[reportMissingImports]
+from gradio_client import Client # pyright: ignore[reportMissingImports]
+from matplotlib.backends.backend_pdf import PdfPages # pyright: ignore[reportMissingModuleSource]
+from PIL import Image # pyright: ignore[reportMissingImports]
+from scipy import ndimage # pyright: ignore[reportMissingImports]
+from skimage.feature import peak_local_max # pyright: ignore[reportMissingModuleSource]
 
 from agentic_countgd import (
     COUNTGD_SPACE,
