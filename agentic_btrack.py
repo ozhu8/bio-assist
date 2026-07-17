@@ -35,6 +35,17 @@ segmentation -- so unlike StarDist's retry loop (which reruns the whole model ea
 iteration), this one runs StarDist once and reuses the cached per-frame instance
 labels across iterations, only rerunning btrack itself.
 
+KNOWN LIMITATION (see CLAUDE.md's `.venv-btrack` section for the full writeup):
+tested directly against a real CTC sequence, `max_search_radius` does NOT act as
+a hard cutoff on link distance -- radius=5 and radius=100 produced near-identical
+links (same max ~974px link distance) against a dataset where the true same-cell
+displacement is ~1-2px/frame. Whatever's actually gating which objects get linked
+lives elsewhere in `cell_config.json` (likely the motion model's own noise
+parameters), so this retry loop currently will NOT converge to good tracking no
+matter how many iterations run -- it's tuning a parameter that isn't the real
+lever. Fixing this means retuning cell_config.json's motion model directly, not
+adjusting anything in this file.
+
 `--images-dir` remains a single forward pass with no ground truth and no Claude
 evaluation loop -- an arbitrary user image sequence has no annotated track IDs to
 score against.
@@ -192,12 +203,29 @@ def track_sequence(pred_labels_stack: list, config_path, max_search_radius: floa
     object's assigned ID to the (frame, label) it came from. This works because
     `BayesianTracker.append` assigns `obj.ID = idx + len(self._objects)` in the
     order objects are passed in, and `segmentation_to_objects` builds that list
-    frame-by-frame (in ascending regionprops label order within each frame) -- so
-    enumerating the pre-append object list gives the exact same IDs append() will
-    assign, without needing to re-derive them via centroid matching afterward."""
+    frame-by-frame -- so enumerating the pre-append object list gives the exact
+    same IDs append() will assign, without needing to re-derive them via centroid
+    matching afterward.
+
+    Note this does NOT use `obj.label`: despite the name, `PyTrackObject.label` is
+    a classification *state* (defaults to `constants.States.NULL` for every object
+    unless `segmentation_to_objects` is called with `assign_class_ID=True`), not
+    the source segmentation's per-frame instance label -- confirmed by inspection,
+    every object came back with the same `label` regardless of which region it
+    was built from. `segmentation_to_objects` never exposes the original region ID
+    directly, so it's recovered from each object's 1-indexed position among
+    objects sharing its frame: it processes frames strictly in order (single
+    worker by default) and, within a frame, regionprops visits labels in
+    ascending order with no gaps (StarDist's own labeling convention), so that
+    position reconstructs the original label exactly."""
     stack = np.stack(pred_labels_stack).astype(np.int32)
     objects = btrack.utils.segmentation_to_objects(stack, properties=("area",))
-    id_to_frame_label = {i: (int(obj.t), int(obj.label)) for i, obj in enumerate(objects)}
+    id_to_frame_label = {}
+    frame_position = {}
+    for i, obj in enumerate(objects):
+        frame = int(obj.t)
+        frame_position[frame] = frame_position.get(frame, 0) + 1
+        id_to_frame_label[i] = (frame, frame_position[frame])
 
     with btrack.BayesianTracker() as tracker:
         tracker.configure(config_path)
