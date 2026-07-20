@@ -33,7 +33,7 @@ from manager_agent import ManagerAgent, MODEL_ID, run_countgd_with_feedback, run
 def build_note(qwen, agent: str, image_id: str, history: list, final_image_path, lower_is_better: bool) -> dict:
     """Turns one image's existing retry-loop history (already produced by
     run_countgd_with_feedback / run_stardist_with_feedback) into a structured training note."""
-    metric_key = "mae" if agent == "countgd" else "pq"
+    metric_key = "internal_mae" if agent == "countgd" else "pq"
     initial_score = history[0][metric_key]
     final_score = history[-1][metric_key]
     accepted = bool(history[-1]["accept"])
