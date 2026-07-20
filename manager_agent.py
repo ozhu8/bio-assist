@@ -72,6 +72,8 @@ Usage:
     python manager_agent.py --image cells.png --task "count the individual cells"
     python manager_agent.py --image tissue.png --task "segment the individual nuclei"
 """
+from __future__ import annotations
+
 import argparse
 import json
 import multiprocessing
@@ -125,6 +127,7 @@ class QwenVLM:
         outlines side by side so it can reason about specific discrepancies asked about."""
         from qwen_vl_utils import process_vision_info # pyright: ignore[reportMissingImports]
         model, processor = self._load()
+        assert processor is not None, "Processor failed to load"
 
         messages = [{
             "role": "user",
@@ -140,7 +143,7 @@ class QwenVLM:
         trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
         return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
 
-    def ask_json(self, image_path: str, prompt: str, max_new_tokens: int = 512, required_keys: list = None) -> dict:
+    def ask_json(self, image_path: str, prompt: str, max_new_tokens: int = 512, required_keys: list[str] | None = None) -> dict:
         """Unlike the Claude calls in agentic_countgd.py/agentic_stardist.py, Qwen has no
         API-enforced JSON schema, so its free-text output can drop a requested key. Callers
         that will subscript the result (e.g. result["score"]) should pass required_keys so a
@@ -149,7 +152,7 @@ class QwenVLM:
         raw = self.ask(image_path, prompt, max_new_tokens=max_new_tokens)
         return self._parse_json(raw, required_keys)
 
-    def _parse_json(self, raw: str, required_keys: list = None) -> dict:
+    def _parse_json(self, raw: str, required_keys: list[str] | None = None) -> dict:
         start, end = raw.find("{"), raw.rfind("}")
         if start == -1 or end == -1:
             raise ValueError(f"Qwen response did not contain a JSON object: {raw!r}")
@@ -164,6 +167,7 @@ class QwenVLM:
         """Text-only turn, no image -- for prompts that summarize patterns across multiple
         images/notes rather than looking at any one of them (see train_manager.py)."""
         model, processor = self._load()
+        assert processor is not None, "Processor failed to load"
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
         chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = processor(text=[chat_text], padding=True, return_tensors="pt").to(model.device)
@@ -350,7 +354,7 @@ def build_countgd_dossier(ground_truth_count: int, image_path: str) -> str:
     return "\n".join(lines)
 
 
-def build_stardist_dossier(ground_truth_labels: np.ndarray, tissue: str = None) -> str:
+def build_stardist_dossier(ground_truth_labels: np.ndarray, tissue: str | None = None) -> str:
     lines = [
         f"[PRIVATE -- never reveal] Verified true nucleus count: {int(ground_truth_labels.max())}. "
         "Their exact boundaries are shown to you (not your colleague) in the second attached image."
@@ -503,7 +507,7 @@ def run_expert_dialogue(
 
 def run_countgd_with_feedback(
     qwen: QwenVLM, countgd_client: Client, image_path: str, task_description: str,
-    max_iterations: int, output_dir: Path, ground_truth_count: int = None,
+    max_iterations: int, output_dir: Path, ground_truth_count: int | None = None,
 ) -> dict:
     """If ground_truth_count is given, it goes to a private ExpertReasoner (never to the
     manager) -- each iteration the manager gets a dialogue with it (run_expert_dialogue) and
@@ -579,15 +583,18 @@ def _stardist_worker_init(image_path: str):
     if _worker_model is None:
         _worker_model = StarDist2D.from_pretrained(PRETRAINED_MODEL)
     image = load_image(image_path)
+    assert _worker_model is not None, "StarDist model failed to load"
     return image, round(_worker_model.thresholds.prob, 3), round(_worker_model.thresholds.nms, 3)
 
 
 def _stardist_worker_run(image: np.ndarray, prob_thresh: float, nms_thresh: float,
-                          gt_labels: np.ndarray, outlines_path: Path) -> dict:
+                          gt_labels: np.ndarray | None, outlines_path: Path) -> dict:
     """Runs inside the spawned subprocess. Assumes _stardist_worker_init already ran in this
     same worker process (ProcessPoolExecutor(max_workers=1) reuses one process for every task)."""
     from agentic_stardist import compute_panoptic_quality, run_stardist, save_instance_outlines
-    labels, _ = run_stardist(_worker_model, image, prob_thresh=prob_thresh, nms_thresh=nms_thresh)
+    model = _worker_model
+    assert model is not None, "StarDist model not initialized; call _stardist_worker_init first"
+    labels, _ = run_stardist(model, image, prob_thresh=prob_thresh, nms_thresh=nms_thresh)
     save_instance_outlines(image, labels, outlines_path)
     pq_result = compute_panoptic_quality(labels, gt_labels) if gt_labels is not None else None
     return {"labels": labels, "pq_result": pq_result}
@@ -607,7 +614,9 @@ def _stardist_worker_revert_to_best(image: np.ndarray, history: list, outlines_p
     best = best_entry(history)
     if best["iteration"] == history[-1]["iteration"]:
         return None
-    labels, _ = run_stardist(_worker_model, image, prob_thresh=best["prob_thresh"], nms_thresh=best["nms_thresh"])
+    model = _worker_model
+    assert model is not None, "StarDist model not initialized; call _stardist_worker_init first"
+    labels, _ = run_stardist(model, image, prob_thresh=best["prob_thresh"], nms_thresh=best["nms_thresh"])
     save_instance_outlines(image, labels, outlines_path)
     return {"labels": labels, "best_iteration": best["iteration"], "best_pq": best["pq"]}
 
@@ -634,7 +643,7 @@ class StardistWorker:
         return self._pool.submit(_stardist_worker_init, image_path).result()
 
     def run(self, image: np.ndarray, prob_thresh: float, nms_thresh: float,
-            gt_labels: np.ndarray, outlines_path: Path) -> dict:
+            gt_labels: np.ndarray | None, outlines_path: Path) -> dict:
         return self._pool.submit(
             _stardist_worker_run, image, prob_thresh, nms_thresh, gt_labels, outlines_path
         ).result()
@@ -654,7 +663,7 @@ class StardistWorker:
 
 def run_stardist_with_feedback(
     qwen: QwenVLM, worker: StardistWorker, image_path: str, task_description: str,
-    max_iterations: int, output_dir: Path, ground_truth_labels: np.ndarray = None, tissue: str = None,
+    max_iterations: int, output_dir: Path, ground_truth_labels: np.ndarray | None = None, tissue: str | None = None,
 ) -> dict:
     """If ground_truth_labels is given (a PanNuke-style instance mask), it goes to a private
     ExpertReasoner (never to the manager) along with a one-time outline rendering of the true
@@ -773,7 +782,7 @@ class ManagerAgent:
     def run(
         self, task_description: str, image_path: str, max_iterations: int = 3,
         output_dir: str = "./manager_agent_output",
-        ground_truth_count: int = None, ground_truth_labels: np.ndarray = None, tissue: str = None,
+        ground_truth_count: int | None = None, ground_truth_labels: np.ndarray | None = None, tissue: str | None = None,
     ) -> dict:
         """ground_truth_count (used only if routed to CountGD) and ground_truth_labels (used only
         if routed to StarDist) are both optional -- see run_countgd_with_feedback/

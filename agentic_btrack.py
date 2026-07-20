@@ -70,10 +70,14 @@ import textwrap
 import urllib.request
 import zipfile
 from pathlib import Path
+from typing import Optional, cast
 
 import anthropic # pyright: ignore[reportMissingImports]
+from anthropic.types import ImageBlockParam # pyright: ignore[reportMissingImports]
 import btrack # pyright: ignore[reportMissingImports]
 import btrack.datasets # pyright: ignore[reportMissingImports]
+import btrack.io # pyright: ignore[reportMissingImports]
+import btrack.utils # pyright: ignore[reportMissingImports]
 import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
 import numpy as np # pyright: ignore[reportMissingImports]
 import tifffile # pyright: ignore[reportMissingImports]
@@ -91,15 +95,15 @@ PDF_NAME = "btrack_results.pdf"
 CTC_URL_TEMPLATE = "https://data.celltrackingchallenge.net/training-datasets/{dataset}.zip"
 
 
-def image_to_content_block(image_path: str) -> dict:
+def image_to_content_block(image_path: str) -> ImageBlockParam:
     mime_type, _ = mimetypes.guess_type(image_path)
     if mime_type is None:
         mime_type = "image/png"
     data = base64.standard_b64encode(Path(image_path).read_bytes()).decode("utf-8")
-    return {
+    return cast(ImageBlockParam, {
         "type": "image",
         "source": {"type": "base64", "media_type": mime_type, "data": data},
-    }
+    })
 
 
 def unique_path(path: Path) -> Path:
@@ -144,10 +148,13 @@ _FRAME_INDEX_RE = re.compile(r"(\d+)\.tif$")
 
 
 def _frame_index(name: str) -> int:
-    return int(_FRAME_INDEX_RE.search(name).group(1))
+    match = _FRAME_INDEX_RE.search(name)
+    if match is None:
+        raise ValueError(f"no frame index found in {name!r}")
+    return int(match.group(1))
 
 
-def load_ctc_sequence(dataset: str, sequence: str, cache_dir: Path, n_frames: int = None) -> tuple:
+def load_ctc_sequence(dataset: str, sequence: str, cache_dir: Path, n_frames: Optional[int] = None) -> tuple:
     """Fetch one CTC training sequence's raw frames and ground-truth track masks.
 
     Ground truth comes from `{dataset}/{sequence}_GT/TRA/man_track*.tif`: CTC's
@@ -193,7 +200,7 @@ def segment_sequence(model: StarDist2D, images: list) -> list:
     return [run_stardist(model, image)[0] for image in images]
 
 
-def track_sequence(pred_labels_stack: list, config_path, max_search_radius: float = None) -> tuple:
+def track_sequence(pred_labels_stack: list, config_path, max_search_radius: Optional[float] = None) -> tuple:
     """Convert per-frame instance labels into btrack objects and link them into tracks.
     max_search_radius=None keeps whatever the config file (config_path) already sets,
     same "None means use the model's/config's own tuned value" convention as
@@ -450,7 +457,7 @@ def _already_tried(value: float, tried: list, tol: float = 0.5) -> bool:
     return any(abs(value - t) < tol for t in tried)
 
 
-def propose_search_radius(current_radius: float, link_result: dict, history: list = None) -> tuple:
+def propose_search_radius(current_radius: float, link_result: dict, history: Optional[list] = None) -> tuple:
     """Free, deterministic alternative to evaluate_result -- no API call, no cost.
     max_search_radius is btrack's only easily-revisable knob (contrast with StarDist's
     prob_thresh/nms_thresh pair), so this is a single-lever rule:
@@ -661,6 +668,8 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     stardist_model = StarDist2D.from_pretrained(STARDIST_PRETRAINED_MODEL)
+    if stardist_model is None:
+        raise RuntimeError(f"failed to load StarDist pretrained model {STARDIST_PRETRAINED_MODEL!r}")
     config_path = btrack.datasets.cell_config()
 
     if args.ctc_dataset:
@@ -684,7 +693,7 @@ def main():
         )
 
         tracks_path = output_dir / TRACKS_NAME
-        with btrack.io.HDF5FileHandler(str(tracks_path), "w", obj_type="obj_type_1") as writer:
+        with btrack.io.HDF5FileHandler(tracks_path, "w", obj_type="obj_type_1") as writer:
             writer.write_tracks(tracks)
 
         pdf_path = unique_path(output_dir / args.pdf_name)
@@ -712,7 +721,7 @@ def main():
     num_tracks = len(tracks)
 
     tracks_path = output_dir / TRACKS_NAME
-    with btrack.io.HDF5FileHandler(str(tracks_path), "w", obj_type="obj_type_1") as writer:
+    with btrack.io.HDF5FileHandler(tracks_path, "w", obj_type="obj_type_1") as writer:
         writer.write_tracks(tracks)
 
     trajectory_path = output_dir / TRAJECTORY_NAME

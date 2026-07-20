@@ -1,5 +1,13 @@
 {
   "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.*",
+    "**/.venv",
+    "**/.venv-btrack",
+    "**/.venv-countgd",
+    "**/.venv-stardist",
+    "**/.venv-manager",
     "**/.venv*"
   ],
   "ignore": [
