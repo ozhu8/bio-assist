@@ -159,11 +159,14 @@ def build_countgd_tasks(n: int, output_dir: Path) -> list:
     return tasks
 
 
-def build_stardist_tasks(manager: ManagerAgent, n: int, fold: int, output_dir: Path) -> list:
+def build_stardist_tasks(manager: ManagerAgent, n: int, fold: int, output_dir: Path, seed: int = 0) -> list:
+    """Uses StardistWorker.load_pannuke_diverse -- indices spread across as many PanNuke tissue
+    types as possible, fetched in one batched read -- instead of the first n images (a single
+    contiguous tissue block) via n separate from-scratch reads."""
+    indices, images, gt_labels_list, tissues = manager.stardist_worker.load_pannuke_diverse(fold, n, seed=seed)
     tasks = []
-    for i in range(n):
-        image, ground_truth_labels, tissue = manager.stardist_worker.load_pannuke_sample(fold, i)
-        image_id = f"pannuke_f{fold}_{i:03d}_{tissue}"
+    for idx, image, ground_truth_labels, tissue in zip(indices, images, gt_labels_list, tissues):
+        image_id = f"pannuke_f{fold}_{idx:04d}_{tissue}"
         image_path = output_dir / f"{image_id}.png"
         Image.fromarray(image).save(image_path)
         tasks.append({
@@ -171,6 +174,14 @@ def build_stardist_tasks(manager: ManagerAgent, n: int, fold: int, output_dir: P
             "ground_truth_labels": ground_truth_labels,
         })
     return tasks
+
+
+def save_checkpoint(path: Path, notes: list, running_prompt: str, total_tasks: int) -> None:
+    completed_ids = [n["image_id"] for n in notes]
+    path.write_text(json.dumps({
+        "completed_ids": completed_ids, "running_prompt": running_prompt, "notes": notes,
+    }, indent=2, default=str))
+    print(f"[checkpoint] {path} ({len(completed_ids)}/{total_tasks} images)")
 
 
 def main():
@@ -182,10 +193,18 @@ def main():
     parser.add_argument("--batch-size", type=int, default=5, help="Images per aggregation round")
     parser.add_argument("--output-dir", default="./train_manager_output")
     parser.add_argument("--model-id", default=MODEL_ID)
+    parser.add_argument(
+        "--resume-from", default=None,
+        help="Path to a checkpoint.json (written every batch) to continue from -- already-"
+             "completed image_ids are skipped and their notes/running_prompt are reloaded. "
+             "--countgd-n/--stardist-n/--pannuke-fold should match (or exceed) the run that "
+             "produced the checkpoint so the same/superset image set is built.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / "checkpoint.json"
 
     manager = ManagerAgent(model_id=args.model_id)
     tasks = (
@@ -197,9 +216,22 @@ def main():
 
     notes = []
     running_prompt = ""
+    if args.resume_from:
+        checkpoint = json.loads(Path(args.resume_from).read_text())
+        notes = checkpoint["notes"]
+        running_prompt = checkpoint["running_prompt"]
+        print(f"Resumed from {args.resume_from}: {len(notes)} images already done, "
+              f"running prompt is {len(running_prompt)} chars.")
+
+    completed_ids = {n["image_id"] for n in notes}
+    remaining_tasks = [t for t in tasks if t["image_id"] not in completed_ids]
+    if len(remaining_tasks) < len(tasks):
+        print(f"Skipping {len(tasks) - len(remaining_tasks)} already-completed images from the resumed checkpoint.")
+
     batch_start = 0
-    for i, task in enumerate(tasks, 1):
-        print(f"=== [{i}/{len(tasks)}] {task['image_id']} ({task['agent']}) ===")
+    new_notes = []
+    for i, task in enumerate(remaining_tasks, 1):
+        print(f"=== [{i}/{len(remaining_tasks)}] {task['image_id']} ({task['agent']}) ===")
         if task["agent"] == "countgd":
             note = run_countgd_trial(
                 manager, task["image_path"], task["image_id"], task["ground_truth_count"],
@@ -211,15 +243,17 @@ def main():
                 args.max_iterations, output_dir,
             )
         notes.append(note)
+        new_notes.append(note)
         print(f"  initial={note['initial_score']}  final={note['final_score']}  accepted={note['accepted']}")
 
-        if i % args.batch_size == 0 or i == len(tasks):
-            batch = notes[batch_start:i]
+        if i % args.batch_size == 0 or i == len(remaining_tasks):
+            batch = new_notes[batch_start:i]
             batch_start = i
             stats = compute_batch_stats(batch)
             print(f"--- batch stats ---\n{json.dumps(stats, indent=2)}")
             running_prompt = summarize_and_merge(manager.qwen, running_prompt, batch, stats)
             print(f"--- updated training prompt ---\n{running_prompt}\n")
+            save_checkpoint(checkpoint_path, notes, running_prompt, len(tasks))
 
     out_path = output_dir / "training_result.json"
     out_path.write_text(json.dumps({"final_prompt": running_prompt, "notes": notes}, indent=2, default=str))
