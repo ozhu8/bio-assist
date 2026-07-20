@@ -7,27 +7,41 @@ Given a task description + image, Qwen:
      (nucleus segmentation) -- by reading the task and looking at the image.
   2. for CountGD, turns the task into a short count target (e.g. "count the
      cells" -> "cell"), same role as agentic_countgd.py's interpret_prompt.
-  3. runs the retry loop itself, up to --max-iterations times. Each agent is
-     scored with its own metric, matching what the standalone scripts already
-     use for the cases where ground truth is available:
-       - CountGD: Mean Absolute Error (MAE) against a known ground-truth
-         count, when one is supplied (e.g. from the BBBC005 manifest, which
-         has a ground_truth_count per synthetic image).
-       - StarDist: Panoptic Quality (PQ), reusing agentic_stardist.py's own
-         compute_panoptic_quality, when a ground-truth instance mask is
-         supplied (e.g. from a PanNuke sample -- PanNuke images and their
-         ground truth are pulled the same way agentic_stardist.py's
-         --pannuke-index path does, via load_pannuke_sample).
-     If no ground truth is supplied for the routed agent (a generic image
-     with no known answer), there's no metric to compute, so Qwen falls back
-     to visually scoring the annotated/outlined image 0-10 instead -- the
-     same fallback either standalone script would face with an arbitrary
-     --image and no ground truth.
-     Either way, when the result isn't accepted, Qwen looks at the image (and
-     the metric breakdown, if there is one) and proposes what to try next --
-     a revised count target for CountGD, revised prob_thresh/nms_thresh for
-     StarDist. This mirrors evaluate_result in agentic_countgd.py/
-     agentic_stardist.py, with Qwen driving it instead of Claude.
+  3. runs the retry loop itself, up to --max-iterations times.
+
+Ground truth is NOT given to the manager. When a ground-truth count (BBBC005)
+or instance mask (PanNuke) is supplied, it instead goes to a separate
+ExpertReasoner persona -- the *same* loaded Qwen weights, reused under a
+different system prompt, playing a domain expert (quantitative biologist /
+digital pathologist) who privately holds the true answer plus some "extra
+data" the manager never sees (BBBC005 focus/stain metadata parsed from the
+image filename; for PanNuke, the tissue type and an outline rendering of the
+real ground-truth instance boundaries). Each iteration, the manager gets up
+to MAX_EXPERT_TURNS question/answer turns with the expert: it can ask about a
+specific detection, cluster, or discrepancy it's unsure about, and the expert
+answers in 2-4 sentences of morphological/domain rationale -- instructed to
+never reveal the ground-truth number/mask or say accept/reject/correct/wrong
+(see EXPERT_PERSONA_COUNTGD / EXPERT_PERSONA_STARDIST). The manager then
+decides accept/reject itself from the dialogue transcript plus the image,
+and if rejecting, proposes the revision itself (a revised count target for
+CountGD, revised prob_thresh/nms_thresh for StarDist) -- mirroring
+evaluate_result in agentic_countgd.py/agentic_stardist.py, but the judgment
+now comes from Qwen reasoning through a dialogue rather than a hard MAE/PQ
+threshold.
+
+The old metric (MAE against the ground-truth count / Panoptic Quality against
+the ground-truth mask) is still computed every iteration when ground truth is
+available, but purely for the run's own history/logging -- as
+"internal_mae"/"internal_pq" plus what the old threshold-based rule would
+have decided ("internal_would_accept") -- so the new dialogue-driven
+judgments can be compared against the old hard-threshold ones after the
+fact. The manager's own prompts never include these numbers.
+
+If no ground truth is supplied for the routed agent (a generic image with no
+known answer), there's no expert to consult either, so Qwen falls back to
+visually scoring the annotated/outlined image 0-10 itself -- the same
+fallback either standalone script would face with an arbitrary --image and
+no ground truth.
 
 agentic_countgd.py and agentic_stardist.py are untouched -- this file only
 imports their run_countgd/run_stardist/compute_panoptic_quality (and
@@ -61,6 +75,7 @@ Usage:
 import argparse
 import json
 import multiprocessing
+import re
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -72,8 +87,9 @@ from agentic_countgd import COUNTGD_SPACE, run_countgd
 
 MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 ACCEPT_SCORE_THRESHOLD = 7  # Qwen's own 0-10 visual score, used when there's no ground truth to measure against
-ACCEPT_PQ_THRESHOLD = 0.5   # StarDist acceptance bar when a ground-truth instance mask is available (PanNuke)
-MAE_TOLERANCE_FRACTION = 0.1  # CountGD acceptance bar when a ground-truth count is available (e.g. BBBC005)
+ACCEPT_PQ_THRESHOLD = 0.5   # old PQ rule, kept only to log internal_would_accept -- see module docstring
+MAE_TOLERANCE_FRACTION = 0.1  # old MAE rule, kept only to log internal_would_accept -- see module docstring
+MAX_EXPERT_TURNS = 5  # cap on manager<->expert question/answer turns per iteration
 
 
 def mae_accept_tolerance(ground_truth_count: int) -> float:
@@ -101,15 +117,18 @@ class QwenVLM:
         return self._model, self._processor
 
     def ask(self, image_path: str, prompt: str, max_new_tokens: int = 512) -> str:
+        return self.ask_images([image_path], prompt, max_new_tokens=max_new_tokens)
+
+    def ask_images(self, image_paths: list, prompt: str, max_new_tokens: int = 512) -> str:
+        """Like ask(), but takes multiple images in one turn -- used by ExpertReasoner to show
+        the StarDist expert both the manager's predicted outlines and the private ground-truth
+        outlines side by side so it can reason about specific discrepancies asked about."""
         from qwen_vl_utils import process_vision_info # pyright: ignore[reportMissingImports]
         model, processor = self._load()
 
         messages = [{
             "role": "user",
-            "content": [
-                {"type": "image", "image": image_path},
-                {"type": "text", "text": prompt},
-            ],
+            "content": [{"type": "image", "image": p} for p in image_paths] + [{"type": "text", "text": prompt}],
         }]
         chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs, video_inputs = process_vision_info(messages)
@@ -128,6 +147,9 @@ class QwenVLM:
         malformed response fails here with a clear message instead of a bare KeyError deep in
         the caller."""
         raw = self.ask(image_path, prompt, max_new_tokens=max_new_tokens)
+        return self._parse_json(raw, required_keys)
+
+    def _parse_json(self, raw: str, required_keys: list = None) -> dict:
         start, end = raw.find("{"), raw.rfind("}")
         if start == -1 or end == -1:
             raise ValueError(f"Qwen response did not contain a JSON object: {raw!r}")
@@ -201,26 +223,27 @@ def evaluate_countgd_visual(
     return qwen.ask_json(annotated_image_path, prompt, required_keys=["accept", "score", "feedback"])
 
 
-def propose_countgd_revision(
+def decide_countgd_from_dialogue(
     qwen: QwenVLM, task_description: str, count_target: str, predicted_count: int,
-    ground_truth_count: int, mae: float, annotated_image_path: str, history: list,
+    dialogue: list, annotated_image_path: str, history: list,
 ) -> dict:
-    """Ground truth available -- MAE decides accept/reject (see run_countgd_with_feedback);
-    Qwen is only asked to propose a better count target, not to judge the result itself."""
+    """Ground truth is never given to the manager (see module docstring) -- instead the manager
+    has just talked to ExpertReasoner (run_expert_dialogue) and decides accept/reject itself from
+    that transcript plus the image, proposing a revised count target if rejecting."""
     prompt = (
         f"Original user request: \"{task_description}\"\n"
         f"CountGD was asked to count: \"{count_target}\"\n"
-        f"Predicted count: {predicted_count}  |  Ground-truth count: {ground_truth_count}  |  "
-        f"MAE: {mae} (above the tolerance of {mae_accept_tolerance(ground_truth_count)})\n"
+        f"Predicted count: {predicted_count}\n"
+        f"Your conversation with the domain expert this iteration:\n{json.dumps(dialogue)}\n"
         f"Prior attempts this session: {json.dumps(history)}\n\n"
-        "The attached image shows CountGD's detections as boxes/heatmap. The predicted count is "
-        "off from the known ground truth by the MAE above. Look at the detections and propose a "
-        "different/more specific text prompt that would plausibly reduce the error -- e.g. if the "
-        "count is far too low, the target may be too narrow or missing overlapping objects; if "
-        "far too high, the target may be matching background clutter or double-counting.\n\n"
-        "Reply with ONLY a JSON object matching this schema: {\"revised_text\": str, \"feedback\": str}"
+        "Based on the expert's reasoning and what you can see in the image yourself, decide "
+        "whether this result satisfies the request. If not, propose a different/more specific "
+        "text prompt for CountGD to retry with, informed by what the expert pointed out (e.g. "
+        "overlapping cells, faint/out-of-focus cells, background clutter).\n\n"
+        "Reply with ONLY a JSON object matching this schema: "
+        "{\"accept\": bool, \"feedback\": str, \"revised_text\": str or null}"
     )
-    return qwen.ask_json(annotated_image_path, prompt, required_keys=["feedback"])
+    return qwen.ask_json(annotated_image_path, prompt, required_keys=["accept", "feedback"])
 
 
 def evaluate_stardist_visual(
@@ -250,45 +273,254 @@ def evaluate_stardist_visual(
     return qwen.ask_json(outlines_image_path, prompt, required_keys=["accept", "score", "feedback"])
 
 
-def propose_stardist_revision(
+def decide_stardist_from_dialogue(
     qwen: QwenVLM, task_description: str, prob_thresh: float, nms_thresh: float,
-    pq_result: dict, outlines_image_path: str, history: list,
+    predicted_count: int, dialogue: list, outlines_image_path: str, history: list,
 ) -> dict:
-    """Ground truth available -- PQ decides accept/reject (see run_stardist_with_feedback);
-    Qwen is only asked to propose revised thresholds, not to judge the result itself."""
+    """Ground truth is never given to the manager (see module docstring) -- instead the manager
+    has just talked to ExpertReasoner (run_expert_dialogue) and decides accept/reject itself from
+    that transcript plus the image, proposing revised thresholds if rejecting."""
     prompt = (
         f"Original user request: \"{task_description}\"\n"
         f"StarDist ran with prob_thresh={prob_thresh:.3f}, nms_thresh={nms_thresh:.3f}\n"
-        f"Panoptic Quality against ground truth: PQ={pq_result['pq']:.3f} "
-        f"(below the {ACCEPT_PQ_THRESHOLD} acceptance bar)\n"
-        f"  mean IoU of matched instances: {pq_result['mean_iou']:.3f}\n"
-        f"  TP={pq_result['tp']}  FP={pq_result['fp']}  FN={pq_result['fn']}\n"
+        f"Detected nuclei: {predicted_count}\n"
+        f"Your conversation with the domain expert this iteration:\n{json.dumps(dialogue)}\n"
         f"Prior attempts this session: {json.dumps(history)}\n\n"
-        "The attached image shows the original tissue with each StarDist-detected nucleus outlined "
-        "in a distinct color. FP = spurious detections with no matching ground-truth nucleus; "
-        "FN = ground-truth nuclei StarDist missed; a low mean IoU on matched pairs means boundaries "
-        "are poorly aligned or instances are being split/merged. Using both these numbers and the "
-        "image, propose revised threshold(s):\n"
-        "  - prob_thresh (0-1): raise it if FP is high, lower it if FN is high.\n"
-        "  - nms_thresh (0-1): lower it if you see duplicate/split outlines around one nucleus; "
-        "raise it if adjacent distinct nuclei look merged into a single outline.\n"
-        "Only set the threshold(s) that address the problem -- leave the other null.\n\n"
-        "Reply with ONLY a JSON object matching this schema: "
-        "{\"revised_prob_thresh\": number or null, \"revised_nms_thresh\": number or null, \"feedback\": str}"
+        "Based on the expert's reasoning and what you can see in the image yourself, decide "
+        "whether this segmentation satisfies the request. If not, propose revised threshold(s): "
+        "raise prob_thresh if the expert's answers suggest false-positive outlines on "
+        "background/noise, lower it if real nuclei sound missed; lower nms_thresh if outlines "
+        "sound duplicated/split around one nucleus, raise it if adjacent distinct nuclei sound "
+        "merged. Only set the threshold(s) that address the problem -- leave the other null.\n\n"
+        "Reply with ONLY a JSON object matching this schema: {\"accept\": bool, \"feedback\": str, "
+        "\"revised_prob_thresh\": number or null, \"revised_nms_thresh\": number or null}"
     )
-    return qwen.ask_json(outlines_image_path, prompt, required_keys=["feedback"])
+    return qwen.ask_json(outlines_image_path, prompt, required_keys=["accept", "feedback"])
+
+
+EXPERT_PERSONA_COUNTGD = (
+    "You are a senior quantitative image-analysis scientist who manually verified the true "
+    "object count in this image as part of a ground-truth annotation study. You are acting as "
+    "a mentor answering a junior colleague's question about a specific automated detection run "
+    "-- you are NOT a scorer. Never state the true count as a number, and never say whether the "
+    "result is 'correct', 'accepted', 'right', or 'wrong', and never use the words "
+    "'accept'/'reject'. Instead, answer only the specific question asked, in 2-4 sentences, "
+    "describing what a careful human annotator would look for in the region/area being asked "
+    "about and why (e.g. touching/overlapping objects that are easy to undercount, faint or "
+    "out-of-focus objects easy to miss, background texture that gets mistaken for an object) -- "
+    "reasoning grounded in the true count you are privately holding, without ever quoting it."
+)
+
+EXPERT_PERSONA_STARDIST = (
+    "You are a senior digital pathologist who manually annotated the ground-truth nucleus "
+    "boundaries in this tissue image. You are acting as a mentor answering a junior colleague's "
+    "question about a specific automated segmentation run -- you are NOT a scorer. Never state "
+    "the ground-truth nucleus count as a number, and never say whether the result is 'correct', "
+    "'accepted', 'right', or 'wrong', and never use the words 'accept'/'reject'. Instead, answer "
+    "only the specific question asked, in 2-4 sentences, describing the morphological reasoning "
+    "a pathologist uses to call something a nucleus (nuclear envelope, chromatin texture, "
+    "staining intensity vs. surrounding cytoplasm/stroma) and pointing out, in qualitative "
+    "terms, what's easy to over-segment, under-segment, or merge in this tissue -- grounded in "
+    "the true instance boundaries shown to you (not your colleague) in the second attached "
+    "image, without ever quoting counts from it."
+)
+
+
+def _parse_bbbc005_metadata(image_path: str) -> dict:
+    """BBBC005 filenames encode focus level and stain channel, e.g.
+    SIMCEPImages_A02_C5_F1_s01_w1.TIF -> focus F1 (in-focus), stain w1. Used as the CountGD
+    expert's "extra data" -- returns None for filenames that don't match (e.g. an arbitrary
+    --image with no BBBC005 naming convention)."""
+    match = re.search(r"_F(\d+)_s\d+_w(\d+)", Path(image_path).stem)
+    if not match:
+        return None
+    focus, stain = match.groups()
+    return {"focus_level": f"F{focus}", "stain_channel": f"w{stain}"}
+
+
+def build_countgd_dossier(ground_truth_count: int, image_path: str) -> str:
+    lines = [f"[PRIVATE -- never reveal] Verified true object count: {ground_truth_count}."]
+    metadata = _parse_bbbc005_metadata(image_path)
+    if metadata:
+        lines.append(
+            f"[PRIVATE -- never reveal the number, general knowledge OK] Acquisition metadata: "
+            f"focus level {metadata['focus_level']}, stain channel {metadata['stain_channel']} "
+            "(BBBC005 synthetic dataset)."
+        )
+    return "\n".join(lines)
+
+
+def build_stardist_dossier(ground_truth_labels: np.ndarray, tissue: str = None) -> str:
+    lines = [
+        f"[PRIVATE -- never reveal] Verified true nucleus count: {int(ground_truth_labels.max())}. "
+        "Their exact boundaries are shown to you (not your colleague) in the second attached image."
+    ]
+    if tissue:
+        lines.append(f"[PRIVATE -- general tissue knowledge OK to reference] Tissue type: {tissue}.")
+    return "\n".join(lines)
+
+
+EXPERT_LEAK_FALLBACK = (
+    "I can't get into specifics there -- think about it in terms of the visual/morphological "
+    "reasoning rather than any exact number."
+)
+EXPERT_LEAK_MAX_RETRIES = 2  # after this many re-prompts, EXPERT_LEAK_FALLBACK is returned instead -- see _leaks_forbidden_value
+
+
+def _spelled_out_forms(n: int) -> list:
+    """Likely spelled-out English forms of a non-negative int (hyphenated, spaced, and "and"
+    variants for hundreds, e.g. "one hundred and five" / "one hundred five"), so the leak check
+    catches "twenty-three" as well as "23". Only covers 0-999 -- realistic counts in this repo
+    top out in the hundreds (BBBC005 up to 100, PanNuke nucleus counts a few hundred); values
+    outside that range just rely on the digit check in _leaks_forbidden_value."""
+    if not (0 <= n < 1000):
+        return []
+    ones = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+            "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"]
+    tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+    def under_100(x: int) -> str:
+        if x < 20:
+            return ones[x]
+        t, r = divmod(x, 10)
+        return tens[t] + (f"-{ones[r]}" if r else "")
+
+    if n < 100:
+        forms = {under_100(n)}
+    else:
+        hundreds, rest = divmod(n, 100)
+        base = f"{ones[hundreds]} hundred"
+        forms = {base} if rest == 0 else {f"{base} {under_100(rest)}", f"{base} and {under_100(rest)}"}
+
+    forms |= {f.replace("-", " ") for f in forms}
+    return sorted(forms)
+
+
+class ExpertReasoner:
+    """Holds ground truth privately and answers the manager's questions with morphological/
+    domain rationale -- never the ground-truth number/mask itself and never an accept/reject
+    verdict (see EXPERT_PERSONA_COUNTGD/EXPERT_PERSONA_STARDIST). Reuses the manager's own
+    already-loaded QwenVLM under a different persona/system framing rather than loading a
+    second 8B model.
+
+    The "never reveal the number" instruction in EXPERT_PERSONA_* is only a prompt -- Qwen is an
+    8B model and can ignore it. answer() backs that instruction with a hard code-level check:
+    forbidden_values are the exact ground-truth number(s), checked both as digits ("23") and as
+    spelled-out English (_spelled_out_forms -- "twenty-three", "twenty three"), and any response
+    containing one as a standalone token is never returned to the caller. It's re-prompted up to
+    EXPERT_LEAK_MAX_RETRIES times, and if it still leaks, answer() returns the fixed
+    EXPERT_LEAK_FALLBACK string instead -- so the manager can never see the true number no matter
+    what the model does, at the cost of an occasional false-positive-triggered generic answer
+    (e.g. a coincidental digit match unrelated to the ground truth)."""
+
+    def __init__(self, qwen: QwenVLM, persona: str, dossier: str, forbidden_values: list):
+        self.qwen = qwen
+        self.persona = persona
+        self.dossier = dossier
+        self._leak_patterns = []
+        for value in forbidden_values:
+            self._leak_patterns.append(str(value))
+            if isinstance(value, int):
+                self._leak_patterns.extend(_spelled_out_forms(value))
+
+    def _leaks_forbidden_value(self, text: str) -> bool:
+        return any(re.search(rf"\b{re.escape(p)}\b", text, re.IGNORECASE) for p in self._leak_patterns)
+
+    def _build_prompt(self, question: str, dialogue_so_far: list, retry_notice: str = "") -> str:
+        return (
+            f"{self.persona}\n\n{self.dossier}\n\n"
+            f"Conversation so far: {json.dumps(dialogue_so_far)}\n\n"
+            f"Colleague's question: \"{question}\"\n\n"
+            f"{retry_notice}"
+            "Respond with your reasoning only, in 2-4 sentences. No JSON, no verdict, no "
+            "numbers from the private facts above."
+        )
+
+    def answer(self, image_paths: list, question: str, dialogue_so_far: list) -> str:
+        prompt = self._build_prompt(question, dialogue_so_far)
+        response = self.qwen.ask_images(image_paths, prompt, max_new_tokens=256).strip()
+        for _ in range(EXPERT_LEAK_MAX_RETRIES):
+            if not self._leaks_forbidden_value(response):
+                return response
+            retry_notice = (
+                f"Your previous answer stated a forbidden private number (\"{response}\"). "
+                "Answer again, describing the reasoning in words only -- no digits from the "
+                "private facts above.\n\n"
+            )
+            prompt = self._build_prompt(question, dialogue_so_far, retry_notice)
+            response = self.qwen.ask_images(image_paths, prompt, max_new_tokens=256).strip()
+        if self._leaks_forbidden_value(response):
+            print(f"    [expert] leaked the private ground-truth value after {EXPERT_LEAK_MAX_RETRIES} retries -- returning fallback instead")
+            return EXPERT_LEAK_FALLBACK
+        return response
+
+
+def manager_ask_expert(
+    qwen: QwenVLM, task_description: str, predicted_summary: str, image_path: str,
+    dialogue_so_far: list, turns_left: int,
+) -> dict:
+    prompt = (
+        "You are a manager agent reviewing a specialist model's result, shown below. You do "
+        "NOT have the ground-truth answer -- a domain expert does, but they will only explain "
+        "their reasoning about specific things you ask, never give you a number or a verdict. "
+        "Look at the image and ask ONE focused question about a specific region, detection, or "
+        "possible discrepancy you want the expert's judgment on -- e.g. whether a cluster looks "
+        "like one object or several, whether a faint region should count at all, whether two "
+        "adjacent outlines should be merged. Do not ask for the count or a yes/no verdict; ask "
+        "about a specific visual thing.\n\n"
+        f"Task: \"{task_description}\"\n"
+        f"Specialist's result: {predicted_summary}\n"
+        f"Conversation with the expert so far: {json.dumps(dialogue_so_far)}\n"
+        f"You have {turns_left} question(s) left.\n\n"
+        "Reply with ONLY a JSON object: {\"done\": bool, \"question\": str or null} -- set "
+        "done=true and question=null once you've asked enough to form your own judgment."
+    )
+    return qwen.ask_json(image_path, prompt, required_keys=["done"])
+
+
+def run_expert_dialogue(
+    qwen: QwenVLM, expert: ExpertReasoner, task_description: str, predicted_summary: str,
+    manager_image_path: str, expert_image_paths: list, max_turns: int = MAX_EXPERT_TURNS,
+) -> list:
+    """Drives up to max_turns question/answer turns between the manager (which only sees
+    manager_image_path -- this iteration's prediction, no ground truth) and the expert (which
+    only sees expert_image_paths -- may include a private ground-truth rendering). The manager
+    can stop early by setting done=true; it is never forced to spend all max_turns."""
+    dialogue = []
+    for turn in range(1, max_turns + 1):
+        ask_result = manager_ask_expert(
+            qwen, task_description, predicted_summary, manager_image_path, dialogue, max_turns - turn + 1
+        )
+        if ask_result.get("done") or not ask_result.get("question"):
+            break
+        question = ask_result["question"]
+        answer = expert.answer(expert_image_paths, question, dialogue)
+        print(f"    [manager -> expert] {question}")
+        print(f"    [expert]  {answer}")
+        dialogue.append({"question": question, "answer": answer})
+    return dialogue
 
 
 def run_countgd_with_feedback(
     qwen: QwenVLM, countgd_client: Client, image_path: str, task_description: str,
     max_iterations: int, output_dir: Path, ground_truth_count: int = None,
 ) -> dict:
-    """If ground_truth_count is given, MAE against it decides accept/reject each iteration
-    (see mae_accept_tolerance) and Qwen only proposes a revised count target (propose_countgd_revision).
-    Otherwise there's nothing to compute MAE against, so Qwen scores the result visually and decides
-    accept/reject itself (evaluate_countgd_visual)."""
+    """If ground_truth_count is given, it goes to a private ExpertReasoner (never to the
+    manager) -- each iteration the manager gets a dialogue with it (run_expert_dialogue) and
+    then decides accept/reject itself from the transcript (decide_countgd_from_dialogue). The
+    old MAE rule is still computed for history/logging only (internal_mae/internal_would_accept
+    -- see module docstring), not used for the decision. Otherwise (no ground truth) there's no
+    expert to consult, so Qwen scores the result visually and decides accept/reject itself
+    (evaluate_countgd_visual)."""
     count_target = interpret_countgd_target(qwen, task_description, image_path)
     print(f"[Qwen] counting target: {count_target!r}")
+
+    expert = None
+    if ground_truth_count is not None:
+        expert = ExpertReasoner(
+            qwen, EXPERT_PERSONA_COUNTGD, build_countgd_dossier(ground_truth_count, image_path),
+            forbidden_values=[ground_truth_count],
+        )
 
     history = []
     saved_path = None
@@ -300,21 +532,22 @@ def run_countgd_with_feedback(
         saved_path.write_bytes(Path(annotated_path).read_bytes())
         print(f"[CountGD] count={predicted_count}")
 
-        if ground_truth_count is not None:
-            mae = abs(predicted_count - ground_truth_count)
-            accept = mae <= mae_accept_tolerance(ground_truth_count)
-            if accept:
-                feedback, revised_text = "MAE met the acceptance tolerance.", None
-            else:
-                proposal = propose_countgd_revision(
-                    qwen, task_description, count_target, predicted_count,
-                    ground_truth_count, mae, str(saved_path), history,
-                )
-                feedback, revised_text = proposal["feedback"], proposal.get("revised_text")
-            print(f"[metric] MAE={mae} accept={accept}")
+        if expert is not None:
+            dialogue = run_expert_dialogue(
+                qwen, expert, task_description, f"predicted count = {predicted_count}",
+                str(saved_path), [image_path],
+            )
+            decision = decide_countgd_from_dialogue(
+                qwen, task_description, count_target, predicted_count, dialogue, str(saved_path), history,
+            )
+            accept, revised_text, feedback = decision["accept"], decision.get("revised_text"), decision["feedback"]
+            internal_mae = abs(predicted_count - ground_truth_count)
+            internal_would_accept = internal_mae <= mae_accept_tolerance(ground_truth_count)
+            print(f"[manager] accept={accept}  (internal_mae={internal_mae}, old-rule would_accept={internal_would_accept})")
             history.append({
                 "iteration": i, "count_target": count_target, "predicted_count": predicted_count,
-                "ground_truth_count": ground_truth_count, "mae": mae, "accept": accept, "feedback": feedback,
+                "dialogue": dialogue, "accept": accept, "feedback": feedback,
+                "internal_mae": internal_mae, "internal_would_accept": internal_would_accept,
             })
         else:
             eval_result = evaluate_countgd_visual(qwen, task_description, count_target, predicted_count, str(saved_path), history)
@@ -379,6 +612,15 @@ def _stardist_worker_revert_to_best(image: np.ndarray, history: list, outlines_p
     return {"labels": labels, "best_iteration": best["iteration"], "best_pq": best["pq"]}
 
 
+def _stardist_worker_save_gt_outlines(image: np.ndarray, gt_labels: np.ndarray, outlines_path: Path) -> None:
+    """Runs inside the spawned subprocess (save_instance_outlines needs the same TF-avoidance
+    treatment as everything else here -- see the module docstring). Renders the ground-truth
+    instance mask the same way predictions are rendered, once per run -- this is the private
+    image ExpertReasoner (not the manager) looks at."""
+    from agentic_stardist import save_instance_outlines
+    save_instance_outlines(image, gt_labels, outlines_path)
+
+
 class StardistWorker:
     """Owns a single persistent spawned subprocess that all StarDist calls are routed through --
     see the module docstring for why StarDist/TensorFlow can't share a process with torch/ROCm.
@@ -403,20 +645,35 @@ class StardistWorker:
     def revert_to_best(self, image: np.ndarray, history: list, outlines_path: Path):
         return self._pool.submit(_stardist_worker_revert_to_best, image, history, outlines_path).result()
 
+    def save_gt_outlines(self, image: np.ndarray, gt_labels: np.ndarray, outlines_path: Path):
+        return self._pool.submit(_stardist_worker_save_gt_outlines, image, gt_labels, outlines_path).result()
+
     def shutdown(self):
         self._pool.shutdown(wait=True)
 
 
 def run_stardist_with_feedback(
     qwen: QwenVLM, worker: StardistWorker, image_path: str, task_description: str,
-    max_iterations: int, output_dir: Path, ground_truth_labels: np.ndarray = None,
+    max_iterations: int, output_dir: Path, ground_truth_labels: np.ndarray = None, tissue: str = None,
 ) -> dict:
-    """If ground_truth_labels is given (a PanNuke-style instance mask), Panoptic Quality against
-    it decides accept/reject each iteration (see compute_panoptic_quality/ACCEPT_PQ_THRESHOLD) and
-    Qwen only proposes revised thresholds (propose_stardist_revision). Otherwise there's no ground
-    truth to compute PQ against, so Qwen scores the result visually and decides accept/reject itself
-    (evaluate_stardist_visual)."""
+    """If ground_truth_labels is given (a PanNuke-style instance mask), it goes to a private
+    ExpertReasoner (never to the manager) along with a one-time outline rendering of the true
+    instance boundaries and, if known, the PanNuke tissue type. Each iteration the manager gets
+    a dialogue with it (run_expert_dialogue) and then decides accept/reject itself from the
+    transcript (decide_stardist_from_dialogue). The old PQ rule is still computed for
+    history/logging only (internal_pq/internal_would_accept -- see module docstring), not used
+    for the decision. Otherwise (no ground truth) there's no expert to consult, so Qwen scores
+    the result visually and decides accept/reject itself (evaluate_stardist_visual)."""
     image, prob_thresh, nms_thresh = worker.init(image_path)
+
+    expert = None
+    if ground_truth_labels is not None:
+        gt_outlines_path = output_dir / "stardist_ground_truth.png"
+        worker.save_gt_outlines(image, ground_truth_labels, gt_outlines_path)
+        expert = ExpertReasoner(
+            qwen, EXPERT_PERSONA_STARDIST, build_stardist_dossier(ground_truth_labels, tissue),
+            forbidden_values=[int(ground_truth_labels.max())],
+        )
 
     history = []
     saved_path = None
@@ -429,23 +686,31 @@ def run_stardist_with_feedback(
         predicted_count = int(labels.max())
         print(f"[StarDist] nuclei={predicted_count}")
 
-        if ground_truth_labels is not None:
+        if expert is not None:
+            dialogue = run_expert_dialogue(
+                qwen, expert, task_description,
+                f"detected nuclei = {predicted_count} (prob_thresh={prob_thresh:.3f}, nms_thresh={nms_thresh:.3f})",
+                str(saved_path), [str(saved_path), str(gt_outlines_path)],
+            )
+            decision = decide_stardist_from_dialogue(
+                qwen, task_description, prob_thresh, nms_thresh, predicted_count, dialogue, str(saved_path), history,
+            )
+            accept = decision["accept"]
+            revised_prob, revised_nms, feedback = decision.get("revised_prob_thresh"), decision.get("revised_nms_thresh"), decision["feedback"]
             pq_result = result["pq_result"]
-            accept = pq_result["pq"] >= ACCEPT_PQ_THRESHOLD
-            if accept:
-                feedback, revised_prob, revised_nms = "PQ met the acceptance threshold.", None, None
-            else:
-                proposal = propose_stardist_revision(
-                    qwen, task_description, prob_thresh, nms_thresh, pq_result, str(saved_path), history
-                )
-                feedback = proposal["feedback"]
-                revised_prob, revised_nms = proposal.get("revised_prob_thresh"), proposal.get("revised_nms_thresh")
-            print(f"[metric] PQ={pq_result['pq']:.3f} accept={accept}")
+            internal_would_accept = pq_result["pq"] >= ACCEPT_PQ_THRESHOLD
+            print(f"[manager] accept={accept}  (internal_pq={pq_result['pq']:.3f}, old-rule would_accept={internal_would_accept})")
             history.append({
+                # pq/mean_iou/tp/fp/fn keep agentic_stardist.py's own field names (unprefixed) --
+                # best_entry() below (imported from that untouched module) keys off e["pq"] to pick
+                # which attempted iteration to report as final. None of this is shown to the
+                # manager or the expert; only internal_would_accept is new (the old threshold rule,
+                # logged for comparison against the manager's dialogue-driven `accept` above).
                 "iteration": i, "prob_thresh": prob_thresh, "nms_thresh": nms_thresh,
-                "predicted_count": predicted_count, "pq": pq_result["pq"], "mean_iou": pq_result["mean_iou"],
+                "predicted_count": predicted_count, "dialogue": dialogue, "accept": accept, "feedback": feedback,
+                "pq": pq_result["pq"], "mean_iou": pq_result["mean_iou"],
                 "tp": pq_result["tp"], "fp": pq_result["fp"], "fn": pq_result["fn"],
-                "accept": accept, "feedback": feedback,
+                "internal_would_accept": internal_would_accept,
             })
         else:
             eval_result = evaluate_stardist_visual(
@@ -508,11 +773,14 @@ class ManagerAgent:
     def run(
         self, task_description: str, image_path: str, max_iterations: int = 3,
         output_dir: str = "./manager_agent_output",
-        ground_truth_count: int = None, ground_truth_labels: np.ndarray = None,
+        ground_truth_count: int = None, ground_truth_labels: np.ndarray = None, tissue: str = None,
     ) -> dict:
         """ground_truth_count (used only if routed to CountGD) and ground_truth_labels (used only
         if routed to StarDist) are both optional -- see run_countgd_with_feedback/
-        run_stardist_with_feedback for what happens when the relevant one is left out."""
+        run_stardist_with_feedback for what happens when the relevant one is left out. Neither
+        ever reaches the manager itself -- see the module docstring: they're handed to a private
+        ExpertReasoner instead. tissue (StarDist/PanNuke only) is extra "expert" context, not a
+        ground truth value on its own."""
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -526,7 +794,7 @@ class ManagerAgent:
             )
         return run_stardist_with_feedback(
             self.qwen, self.stardist_worker, image_path, task_description, max_iterations, out_dir,
-            ground_truth_labels=ground_truth_labels,
+            ground_truth_labels=ground_truth_labels, tissue=tissue,
         )
 
 
@@ -537,12 +805,16 @@ def main():
     parser.add_argument(
         "--ground-truth-count", type=int, default=None,
         help="Known true count for the image (e.g. from the BBBC005 manifest) -- if set and the "
-             "task routes to CountGD, MAE against this decides accept/reject instead of Qwen's visual score",
+             "task routes to CountGD, this goes to a private ExpertReasoner instead of the manager; "
+             "the manager talks to it and decides accept/reject itself (see module docstring), "
+             "instead of falling back to Qwen's own visual score",
     )
     parser.add_argument(
         "--ground-truth-labels", default=None,
         help="Path to a .npy ground-truth instance-label mask -- if set and the task routes to "
-             "StarDist, Panoptic Quality against this decides accept/reject instead of Qwen's visual score",
+             "StarDist, this goes to a private ExpertReasoner instead of the manager; the manager "
+             "talks to it and decides accept/reject itself (see module docstring), instead of "
+             "falling back to Qwen's own visual score",
     )
     parser.add_argument(
         "--pannuke-index", type=int, default=None,
@@ -564,6 +836,7 @@ def main():
 
     image_path = args.image
     ground_truth_labels = None
+    tissue = None
     if args.pannuke_index is not None:
         print(f"Fetching PanNuke fold {args.pannuke_fold} image {args.pannuke_index}...")
         image, ground_truth_labels, tissue = manager.stardist_worker.load_pannuke_sample(
@@ -577,7 +850,7 @@ def main():
 
     result = manager.run(
         args.task, image_path, args.max_iterations, args.output_dir,
-        ground_truth_count=args.ground_truth_count, ground_truth_labels=ground_truth_labels,
+        ground_truth_count=args.ground_truth_count, ground_truth_labels=ground_truth_labels, tissue=tissue,
     )
 
     print("\n=== Final result ===")

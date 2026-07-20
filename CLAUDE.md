@@ -187,10 +187,24 @@ inference, outline PNG) works with GPU matmuls succeeding both before and after.
 
 - `manager_agent.py` uses Qwen3-VL-8B-Instruct (local, via `transformers`) instead
   of Claude to route tasks to CountGD/StarDist and drive the retry/feedback loop.
-  Scored by MAE (CountGD) or Panoptic Quality (StarDist) when ground truth is
-  available (BBBC005 manifest / PanNuke masks), falling back to Qwen's own 0-10
-  visual scoring otherwise. `agentic_countgd.py`/`agentic_stardist.py` themselves
-  are untouched -- the manager only imports their existing functions.
+  Ground truth (BBBC005 counts / PanNuke masks) is never given to the manager
+  itself -- it goes to a separate `ExpertReasoner` persona (the same loaded Qwen
+  weights, reused under a different system prompt as a domain expert who privately
+  holds the true answer plus extra "expert" context: BBBC005 focus/stain metadata
+  parsed from the filename, or PanNuke tissue type + a rendered outline of the real
+  ground-truth nucleus boundaries). Each iteration the manager gets up to 5
+  question/answer turns with the expert (`run_expert_dialogue`) -- the expert
+  explains its morphological/domain reasoning but is instructed to never state the
+  ground-truth number or say accept/reject/correct/wrong -- and the manager decides
+  accept/reject itself from that transcript (`decide_countgd_from_dialogue`/
+  `decide_stardist_from_dialogue`). The old MAE/PQ threshold rule is still computed
+  every iteration but purely for history/logging (`internal_mae`/`internal_pq`/
+  `internal_would_accept`), to compare the new dialogue-driven judgments against the
+  old hard-threshold ones after the fact -- it's never in the manager's own prompts.
+  Falls back to Qwen's own 0-10 visual scoring (no expert, no dialogue) when no
+  ground truth is supplied for the routed agent. `agentic_countgd.py`/
+  `agentic_stardist.py` themselves are untouched -- the manager only imports their
+  existing functions.
 - No API key is required to run `manager_agent.py` -- Qwen runs locally, CountGD is
   a public hosted Gradio Space. The `anthropic` package is still a required import
   (transitively, via `agentic_countgd.py`/`agentic_stardist.py`) but is never called.
