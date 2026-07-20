@@ -183,6 +183,8 @@ def main():
     parser.add_argument("--output-dir", default="./train_manager_output")
     parser.add_argument("--model-id", default=MODEL_ID)
     args = parser.parse_args()
+    if args.max_iterations < 1:
+        parser.error("--max-iterations must be at least 1")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

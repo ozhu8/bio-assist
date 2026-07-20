@@ -753,6 +753,7 @@ def run_stardist_with_feedback(
             labels = revert["labels"]
             saved_path = output_dir / "stardist_best.png"
 
+    assert labels is not None, "max_iterations must be at least 1"
     return {
         "agent": "stardist", "num_nuclei": int(labels.max()), "labels": labels,
         "outlines_image": saved_path, "history": history,
@@ -838,6 +839,8 @@ def main():
     args = parser.parse_args()
     if args.image is None and args.pannuke_index is None:
         parser.error("one of --image or --pannuke-index is required")
+    if args.max_iterations < 1:
+        parser.error("--max-iterations must be at least 1")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -858,6 +861,7 @@ def main():
     elif args.ground_truth_labels is not None:
         ground_truth_labels = np.load(args.ground_truth_labels)
 
+    assert image_path is not None, "one of --image or --pannuke-index is required"
     result = manager.run(
         args.task, image_path, args.max_iterations, args.output_dir,
         ground_truth_count=args.ground_truth_count, ground_truth_labels=ground_truth_labels, tissue=tissue,
