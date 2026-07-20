@@ -29,6 +29,95 @@ python -m venv .venv-stardist
 at import time, not declared as a pip dependency, so it must be installed
 explicitly or you'll get `RuntimeError: Please install TensorFlow`.
 
+### `.venv-btrack` -- for `agentic_btrack.py`
+```
+python -m venv .venv-btrack
+.venv-btrack/Scripts/pip install anthropic matplotlib pillow numpy scikit-image tifffile imagecodecs btrack stardist csbdeep tensorflow fsspec aiohttp
+```
+Needs `stardist`/`csbdeep`/`tensorflow` for the same reason `manager_agent.py` does
+(same gotcha as above): it imports `run_stardist` from `agentic_stardist.py` at
+module load time, to segment each frame before btrack links them across time --
+and since that pulls in all of `agentic_stardist.py`'s own imports too, it also
+needs `fsspec`/`aiohttp` (the PanNuke partial-read deps `agentic_stardist.py`
+uses) even though `agentic_btrack.py` itself never touches PanNuke. Needs
+`imagecodecs` too -- Cell Tracking Challenge's raw/GT TIFFs are LZW-compressed,
+and `tifffile.imread` raises `ValueError: <COMPRESSION.LZW: 5> requires the
+'imagecodecs' package` without it.
+
+**On Apple Silicon, build this venv with a native arm64 Python, not an
+Intel/x86_64 one.** `python -m venv` on macOS uses whatever `python`/`python3`
+resolves to on `PATH` -- if that happens to be an x86_64-only build (e.g. an old
+`/Library/Frameworks/Python.framework` install), every run goes through Rosetta
+2, and Rosetta's one-time ahead-of-time translation of TensorFlow's ~700MB
+`libtensorflow_cc.2.dylib` took 13+ minutes and then hung in an uninterruptible
+kernel wait (`ps` showed `UE` state, not even killable with `kill -9`) before
+this was caught. Check with `file $(which python3)` before creating the venv
+(want `arm64`, not `x86_64`); `/opt/anaconda3/bin/python3` was the arm64 option
+on this machine. Rebuilding the venv with that interpreter dropped the same
+import from 13+ minutes (hung) to ~4s warm / ~57s cold.
+
+**`import btrack` alone does not expose `btrack.datasets`** -- `btrack/__init__.py`
+(as of btrack 0.7.0) only imports `BayesianTracker`, not the `datasets`
+submodule, even though `btrack.datasets.cell_config()` (used to fetch the
+default tracker config) is real, documented API. Fixed in `agentic_btrack.py`
+by adding an explicit `import btrack.datasets` alongside `import btrack`.
+
+Verified end-to-end 2026-07-17: `--images-dir` against a synthetic 6-frame/
+5-blob sequence (generated locally, not part of the repo) correctly produced 5
+tracks whose plotted trajectories matched each blob's actual direction of
+motion, plus a PDF report and `.h5` tracks file.
+
+**`PyTrackObject.label` is NOT the source segmentation's per-frame instance/region
+ID, despite the name** -- it's a classification *state* field that defaults to
+`constants.States.NULL` for every object unless `segmentation_to_objects` is
+called with `assign_class_ID=True`. Every object came back with the identical
+`label` value regardless of which region it was built from -- confirmed by direct
+inspection (`obj.label` was `5` for all 130 objects across 3 frames of visibly
+different regions). This silently broke the (frame, label) -> btrack track ID
+mapping `agentic_btrack.py`'s ground-truth scoring depends on (`pred_track_id_map`
+had 2 entries instead of 86). Fixed in `track_sequence` by reconstructing each
+object's original label from its 1-indexed position among objects sharing its
+frame instead -- valid because `segmentation_to_objects` processes frames
+strictly in order (single worker by default) and regionprops visits labels in
+ascending order with no gaps (StarDist's own convention).
+
+**Even with that fixed, `--ctc-dataset` tracking accuracy against ground truth is
+currently bad (link_accuracy ~0), and it's NOT a script bug -- `max_search_radius`
+does not act as a hard cutoff on link distance.** Tested directly against 3 frames
+of `Fluo-N2DL-HeLa` (true same-cell displacement ~1-2px there): `max_search_radius=5`
+and `max_search_radius=100` produced near-identical results -- same 43 links, same
+973.8px maximum link distance, same ~370px mean. Whatever's actually gating which
+objects get linked together is coming from elsewhere in `cell_config.json` (most
+likely the motion model's own process/measurement noise parameters), not the
+`max_search_radius` knob `agentic_btrack.py`'s retry loop (`propose_search_radius`)
+is built around -- so as currently written, that retry loop will not converge to
+good tracking on this dataset no matter how many iterations it runs, since it's
+tuning a parameter that isn't the actual lever. **Paused here, not fixed**: the
+real fix would mean investigating/retuning `cell_config.json`'s motion-model noise
+parameters directly (its example config is presumably tuned for a reference
+dataset with a very different displacement scale than this one), which is a
+larger, more open-ended task than the mapping bug above. `imagecodecs` had to be
+added too (see the install command above) to read Cell Tracking Challenge's
+LZW-compressed TIFFs.
+
+**On this Windows/OneDrive checkout specifically**, built at
+`C:\Users\hanna\venvs\bio-assist\.venv-btrack` instead of `.venv-btrack` in the
+repo root like the others -- deliberately outside the OneDrive-synced folder, to
+avoid repeating the quota problem noted above (`tensorflow` alone is well over
+500MB). Run scripts by pointing at that interpreter directly from the repo root,
+e.g. `"C:\Users\hanna\venvs\bio-assist\.venv-btrack\Scripts\python" agentic_btrack.py ...`
+Worth doing the same for the other three venvs next time they need recreating.
+Also hit, and worked around without any system changes: `StarDist2D.from_pretrained`
+tries to `symlink_to` its extracted model cache (`csbdeep`'s `get_model_folder`,
+keras >= 3.6.0 codepath) and Windows requires either admin rights or Developer
+Mode for unprivileged symlinks -- `OSError: [WinError 1314] A required privilege
+is not held by the client`. Since the target content is already sitting right
+there under the `*_extracted` suffix, a plain recursive copy to the non-suffixed
+name (`cp -r ..._extracted ...` with the suffix stripped, under
+`~/.keras/models/StarDist2D/<model>/`) satisfies the `path_folder.exists()` check
+csbdeep does before attempting the symlink, so it's never attempted at all on
+subsequent runs.
+
 ### `.venv-manager` -- for `manager_agent.py` (Qwen3-VL manager)
 ```
 python -m venv .venv-manager
@@ -111,10 +200,34 @@ inference, outline PNG) works with GPU matmuls succeeding both before and after.
 
 - `manager_agent.py` uses Qwen3-VL-8B-Instruct (local, via `transformers`) instead
   of Claude to route tasks to CountGD/StarDist and drive the retry/feedback loop.
-  Scored by MAE (CountGD) or Panoptic Quality (StarDist) when ground truth is
-  available (BBBC005 manifest / PanNuke masks), falling back to Qwen's own 0-10
-  visual scoring otherwise. `agentic_countgd.py`/`agentic_stardist.py` themselves
-  are untouched -- the manager only imports their existing functions.
+  Ground truth (BBBC005 counts / PanNuke masks) is never given to the manager
+  itself -- it goes to a separate `ExpertReasoner` persona (the same loaded Qwen
+  weights, reused under a different system prompt as a domain expert who privately
+  holds the true answer plus extra "expert" context: BBBC005 focus/stain metadata
+  parsed from the filename, or PanNuke tissue type + a rendered outline of the real
+  ground-truth nucleus boundaries). Each iteration the manager gets up to 5
+  question/answer turns with the expert (`run_expert_dialogue`) -- the expert
+  explains its morphological/domain reasoning but is instructed to never state the
+  ground-truth number or say accept/reject/correct/wrong -- and the manager decides
+  accept/reject itself from that transcript (`decide_countgd_from_dialogue`/
+  `decide_stardist_from_dialogue`). The old MAE/PQ threshold rule is still computed
+  every iteration but purely for history/logging (`internal_mae`/`internal_pq`/
+  `internal_would_accept`), to compare the new dialogue-driven judgments against the
+  old hard-threshold ones after the fact -- it's never in the manager's own prompts.
+  Falls back to Qwen's own 0-10 visual scoring (no expert, no dialogue) when no
+  ground truth is supplied for the routed agent. `agentic_countgd.py`/
+  `agentic_stardist.py` themselves are untouched -- the manager only imports their
+  existing functions.
 - No API key is required to run `manager_agent.py` -- Qwen runs locally, CountGD is
   a public hosted Gradio Space. The `anthropic` package is still a required import
   (transitively, via `agentic_countgd.py`/`agentic_stardist.py`) but is never called.
+- `agentic_btrack.py` follows the same CountGD/StarDist shape but tracks cells across
+  a frame sequence instead of scoring one image: it reuses `run_stardist` from
+  `agentic_stardist.py` unchanged to segment each frame, then runs btrack to link
+  those per-frame instances into tracks. Ground truth comes from Cell Tracking
+  Challenge (celltrackingchallenge.net) training sequences instead of PanNuke, scored
+  with a simplified link-accuracy proxy (not the official CTC TRA/AOGM metric -- see
+  the script's docstring and `compute_link_accuracy`). The retry knob is btrack's
+  `max_search_radius`, the only easily-revisable parameter, rather than StarDist's
+  prob_thresh/nms_thresh pair. Written but not yet run end-to-end -- see the
+  `.venv-btrack` note above.

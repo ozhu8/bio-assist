@@ -19,9 +19,11 @@ from pathlib import Path
 import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
 import numpy as np # pyright: ignore[reportMissingImports]
 from matplotlib.backends.backend_pdf import PdfPages # pyright: ignore[reportMissingModuleSource]
+from matplotlib.lines import Line2D # pyright: ignore[reportMissingModuleSource]
+from matplotlib.patches import Rectangle # pyright: ignore[reportMissingModuleSource]
 from PIL import Image # pyright: ignore[reportMissingImports]
 from scipy import ndimage # pyright: ignore[reportMissingImports]
-from scipy.spatial import cKDTree # pyright: ignore[reportMissingImports]
+from scipy.spatial import cKDTree # pyright: ignore[reportAttributeAccessIssue]
 from skimage.feature import peak_local_max # pyright: ignore[reportMissingModuleSource]
 
 PDF_NAME = "comparison_results.pdf"
@@ -166,21 +168,21 @@ def missed_cells_page(
         ax.axis("off")
         ax.set_title(title, fontsize=11)
         for row, col in missed_by_baseline:
-            ax.add_patch(plt.Rectangle(
+            ax.add_patch(Rectangle(
                 (col - half, row - half), box_size, box_size,
                 edgecolor=COLOR_MISSED_BY_BASELINE, facecolor="none", linewidth=1.5,
             ))
         for row, col in missed_by_agentic:
-            ax.add_patch(plt.Rectangle(
+            ax.add_patch(Rectangle(
                 (col - half, row - half), box_size, box_size,
                 edgecolor=COLOR_MISSED_BY_AGENTIC, facecolor="none", linewidth=1.5,
             ))
 
     fig.suptitle("Missed-cell diff (dot-detection heuristic)", fontsize=14, fontweight="bold")
     legend_handles = [
-        plt.Line2D([0], [0], color=COLOR_MISSED_BY_BASELINE, lw=1.5,
+        Line2D([0], [0], color=COLOR_MISSED_BY_BASELINE, lw=1.5,
                    label="found by agentic, missed by CountGD alone"),
-        plt.Line2D([0], [0], color=COLOR_MISSED_BY_AGENTIC, lw=1.5,
+        Line2D([0], [0], color=COLOR_MISSED_BY_AGENTIC, lw=1.5,
                    label="found by CountGD alone, missed by agentic"),
     ]
     legend = fig.legend(handles=legend_handles, loc="lower center", ncol=1, fontsize=9, frameon=True)

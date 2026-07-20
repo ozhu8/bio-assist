@@ -18,11 +18,12 @@ state is lost on restart and never evicted.
 
 Run with: python app.py
 """
-import mimetypes
+import mimetypes 
 import os
 import threading
 import uuid
 from pathlib import Path
+from typing import Optional
 
 # Must run before anything (including agentic_countgd/compare_results) imports
 # matplotlib.pyplot. On macOS, matplotlib's default interactive backend talks
@@ -39,6 +40,8 @@ import numpy as np # pyright: ignore[reportMissingImports]
 from flask import Flask, flash, jsonify, redirect, render_template, request, send_file, url_for # pyright: ignore[reportMissingImports]
 from gradio_client import Client # pyright: ignore[reportMissingImports]
 from matplotlib.backends.backend_pdf import PdfPages # pyright: ignore[reportMissingModuleSource]
+from matplotlib.lines import Line2D # pyright: ignore[reportMissingModuleSource]
+from matplotlib.patches import Rectangle # pyright: ignore[reportMissingModuleSource]
 from PIL import Image # pyright: ignore[reportMissingImports]
 from scipy import ndimage # pyright: ignore[reportMissingImports]
 from skimage.feature import peak_local_max # pyright: ignore[reportMissingModuleSource]
@@ -107,7 +110,7 @@ def get_cancel_event(run_id: str) -> threading.Event:
         return event
 
 
-def check_cancelled(cancel_event: threading.Event) -> None:
+def check_cancelled(cancel_event: Optional[threading.Event]) -> None:
     if cancel_event is not None and cancel_event.is_set():
         raise RunCancelled()
 
@@ -264,21 +267,21 @@ def missed_cells_page(pdf: PdfPages, baseline_image: str, agentic_image: str, ma
         ax.axis("off")
         ax.set_title(title, fontsize=11)
         for row, col in missed_by_baseline:
-            ax.add_patch(plt.Rectangle(
+            ax.add_patch(Rectangle(
                 (col - half, row - half), box_size, box_size,
                 edgecolor=COLOR_MISSED_BY_BASELINE, facecolor="none", linewidth=1.5,
             ))
         for row, col in missed_by_agentic:
-            ax.add_patch(plt.Rectangle(
+            ax.add_patch(Rectangle(
                 (col - half, row - half), box_size, box_size,
                 edgecolor=COLOR_MISSED_BY_AGENTIC, facecolor="none", linewidth=1.5,
             ))
 
     fig.suptitle("Missed-cell diff (adaptive dot-detection heuristic)", fontsize=14, fontweight="bold")
     legend_handles = [
-        plt.Line2D([0], [0], color=COLOR_MISSED_BY_BASELINE, lw=1.5,
+        Line2D([0], [0], color=COLOR_MISSED_BY_BASELINE, lw=1.5,
                    label="found by agentic, missed by CountGD alone"),
-        plt.Line2D([0], [0], color=COLOR_MISSED_BY_AGENTIC, lw=1.5,
+        Line2D([0], [0], color=COLOR_MISSED_BY_AGENTIC, lw=1.5,
                    label="found by CountGD alone, missed by agentic"),
     ]
     legend = fig.legend(handles=legend_handles, loc="lower center", ncol=1, fontsize=9, frameon=True)
@@ -415,6 +418,8 @@ def compare():
     baseline_count = None
     baseline_raw_image = None
     baseline_text = None
+    baseline_image_path = None
+    baseline_raw_image_path = None
 
     if baseline_mode == "finished":
         baseline_image = request.files.get("baseline_image")
@@ -449,6 +454,11 @@ def compare():
     run_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        raw_image_path = None
+        agentic_finished_image_path = None
+        baseline_image_path = None
+        baseline_raw_image_path = None
+
         if agentic_source_mode == "run":
             raw_image_path = save_upload(raw_image, UPLOAD_DIR)
         else:
@@ -472,7 +482,7 @@ def compare():
                 check_cancelled(cancel_event)
                 set_progress(run_id, 0.03, f"Running CountGD alone on “{baseline_text}”…")
                 baseline_annotated_path, resolved_baseline_count = run_countgd(
-                    get_countgd(), str(baseline_raw_image_path), baseline_text
+                    get_countgd(), str(baseline_raw_image_path), baseline_text or ""
                 )
                 baseline_suffix = Path(baseline_annotated_path).suffix or ".png"
                 resolved_baseline_image_path = run_dir / f"baseline{baseline_suffix}"
@@ -488,10 +498,14 @@ def compare():
                     resolved_baseline_count = len(detect_dot_coords_adaptive(str(resolved_baseline_image_path)))
                     set_progress(run_id, 0.15, f"Estimated {resolved_baseline_count} from the image")
                 else:
-                    resolved_baseline_count = baseline_count
+                    resolved_baseline_count = baseline_count or 0
 
             # --- Agentic side: 0.15 - 0.80 ---
             if agentic_source_mode == "run":
+                # raw_image_path and prompt are set above when agentic_source_mode == "run";
+                # assert to narrow their types for the type checker.
+                assert raw_image_path is not None
+                assert prompt is not None
                 agentic_result = run_agentic_pipeline(
                     raw_image_path, prompt, run_dir,
                     # Scale the agentic pipeline's own 0-1 progress into the

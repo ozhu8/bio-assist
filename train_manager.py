@@ -24,7 +24,7 @@ import argparse
 import json
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image # pyright: ignore[reportMissingImports]
 
 from bbbc005 import load_bbbc005_samples
 from manager_agent import ManagerAgent, MODEL_ID, run_countgd_with_feedback, run_stardist_with_feedback
@@ -201,6 +201,8 @@ def main():
              "produced the checkpoint so the same/superset image set is built.",
     )
     args = parser.parse_args()
+    if args.max_iterations < 1:
+        parser.error("--max-iterations must be at least 1")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

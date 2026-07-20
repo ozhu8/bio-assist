@@ -44,14 +44,17 @@ Usage:
 import argparse
 import base64
 import contextlib
+import io
 import json
 import mimetypes
 import random
 import textwrap
 import zipfile
 from pathlib import Path
+from typing import IO, Optional, Tuple, cast
 
 import anthropic # pyright: ignore[reportMissingImports]
+from anthropic.types import ImageBlockParam # pyright: ignore[reportMissingImports]
 import fsspec # pyright: ignore[reportMissingImports]
 import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
 import numpy as np # pyright: ignore[reportMissingImports]
@@ -77,7 +80,7 @@ PANNUKE_FOLD_URL = "https://warwick.ac.uk/fac/cross_fac/tia/data/pannuke/fold_{f
 TISSUE_DIVERSITY_MAX_INDEX = 1500
 
 
-def image_to_content_block(image_path: str) -> dict:
+def image_to_content_block(image_path: str):
     mime_type, _ = mimetypes.guess_type(image_path)
     if mime_type is None:
         mime_type = "image/png"
@@ -148,14 +151,16 @@ def _read_array_prefix(zf: zipfile.ZipFile, member: str, n: int, retries: int = 
         except Exception as exc:
             last_exc = exc
             print(f"  [retry {attempt}/{retries}] read of {member} dropped ({exc}); reopening and retrying...")
-    raise last_exc
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"Failed to read {member}: retries={retries}")
 
 
 PANNUKE_HTTP_BLOCK_SIZE = 512 * 1024
 
 
 @contextlib.contextmanager
-def _open_pannuke_zip(fold: int, block_size: int = None):
+def _open_pannuke_zip(fold: int, block_size: int | None = None):
     """fsspec's default HTTP block size (~5MB) is what PanNuke's server actually times
     out mid-transfer on -- observed failing at a consistent ~4.2-4.6MB into a ~5MB block
     regardless of how small a chunk_size Python-level .read() calls request, since that
@@ -163,14 +168,13 @@ def _open_pannuke_zip(fold: int, block_size: int = None):
     makes each underlying HTTP range request small enough to reliably complete.
     Context manager so the underlying fsspec HTTP handle (which ZipFile.close() does not
     close, since it didn't open the path itself) always gets closed too."""
-    open_kwargs = {"block_size": block_size} if block_size is not None else {}
-    fp = fsspec.open(PANNUKE_FOLD_URL.format(fold=fold), **open_kwargs).open()
-    zf = zipfile.ZipFile(fp)
-    try:
-        yield zf
-    finally:
-        zf.close()
-        fp.close()
+    with fsspec.open(PANNUKE_FOLD_URL.format(fold=fold), mode="rb", block_size=block_size) as fp:  # type: ignore[assignment]
+        data = fp.read()  # type: ignore[attr-defined]
+        zf = zipfile.ZipFile(io.BytesIO(data))
+        try:
+            yield zf
+        finally:
+            zf.close()
 
 
 def load_pannuke_images(fold: int, n: int):
@@ -200,7 +204,7 @@ def load_pannuke_types(fold: int) -> list:
     return [str(t) for t in types]
 
 
-def select_diverse_indices(types: list, n: int, max_index: int = None, seed: int = 0) -> list:
+def select_diverse_indices(types: list, n: int, max_index: int | None = None, seed: int = 0) -> list:
     """Pick n indices spanning as many distinct tissue types as possible instead of the
     first n (which in PanNuke is a single contiguous tissue block). max_index bounds how
     deep into the fold to look (see TISSUE_DIVERSITY_MAX_INDEX) -- a tissue whose earliest
@@ -284,12 +288,21 @@ def load_pannuke_sample(fold: int, index: int):
     return images[-1], gt_labels_list[-1], tissue_labels[-1]
 
 
-def run_stardist(model: StarDist2D, image: np.ndarray, prob_thresh: float = None, nms_thresh: float = None):
+def run_stardist(
+    model: StarDist2D, image: np.ndarray, prob_thresh: Optional[float] = None, nms_thresh: Optional[float] = None
+) -> Tuple[np.ndarray, dict]:
     """One StarDist forward pass: normalize the image, predict instance labels.
 
-    prob_thresh/nms_thresh default to the model's own tuned values (None)."""
+    prob_thresh/nms_thresh default to the model's own tuned values (None). predict_instances
+    is implemented as a wrapped generator internally (stardist/models/base.py) that yields
+    progress markers ('predict', 'tile', 'nms') before its real result -- Pyright's inference
+    picks up that whole union of yielded types, even though with return_predict=False (the
+    default, used here) it always actually returns the (labels, details) tuple at runtime."""
     normalized = normalize(image, 1, 99.8, axis=(0, 1))
-    labels, details = model.predict_instances(normalized, prob_thresh=prob_thresh, nms_thresh=nms_thresh)
+    labels, details = cast(
+        Tuple[np.ndarray, dict],
+        model.predict_instances(normalized, prob_thresh=prob_thresh, nms_thresh=nms_thresh),
+    )
     return labels, details
 
 
@@ -394,7 +407,7 @@ def evaluate_result(
         messages=[{
             "role": "user",
             "content": [
-                image_to_content_block(outlines_image_path),
+                image_to_content_block(outlines_image_path),  # type: ignore
                 {"type": "text", "text": (
                     f"Original user request: \"{user_prompt}\"\n"
                     f"StarDist ran with prob_thresh={prob_thresh:.3f}, nms_thresh={nms_thresh:.3f}\n"
@@ -478,7 +491,7 @@ def _already_tried(value: float, tried: list, tol: float = 0.001) -> bool:
     return any(abs(value - t) < tol for t in tried)
 
 
-def propose_thresholds(prob_thresh: float, nms_thresh: float, pq_result: dict, history: list = None) -> tuple:
+def propose_thresholds(prob_thresh: float, nms_thresh: float, pq_result: dict, history: list | None = None) -> tuple:
     """Free, deterministic alternative to evaluate_result -- no API call, no cost. Reasons
     from the same TP/FP/FN/mean-IoU breakdown Claude would have been shown:
       - FP > FN (more spurious detections than misses): raise prob_thresh.
@@ -857,6 +870,8 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model = StarDist2D.from_pretrained(PRETRAINED_MODEL)
+    if model is None:
+        raise RuntimeError(f"Failed to load StarDist model '{PRETRAINED_MODEL}'")
 
     if args.pannuke_index is not None:
         claude = anthropic.Anthropic() if args.claude_feedback else None
@@ -950,7 +965,6 @@ def main():
     if args.pannuke_n is not None:
         print(f"Fetching {args.pannuke_n} images from PanNuke fold {args.pannuke_fold}...")
         images, tissue_labels = load_pannuke_images(args.pannuke_fold, args.pannuke_n)
-
         results = []
         for idx, (image, tissue) in enumerate(zip(images, tissue_labels)):
             stem = f"pannuke_fold{args.pannuke_fold}_{idx:02d}"

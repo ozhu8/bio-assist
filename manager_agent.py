@@ -344,7 +344,7 @@ EXPERT_PERSONA_STARDIST = (
 )
 
 
-def _parse_bbbc005_metadata(image_path: str) -> dict:
+def _parse_bbbc005_metadata(image_path: str) -> dict | None:
     """BBBC005 filenames encode focus level and stain channel, e.g.
     SIMCEPImages_A02_C5_F1_s01_w1.TIF -> focus F1 (in-focus), stain w1. Used as the CountGD
     expert's "extra data" -- returns None for filenames that don't match (e.g. an arbitrary
@@ -559,6 +559,7 @@ def run_countgd_with_feedback(
                 qwen, task_description, count_target, predicted_count, dialogue, str(saved_path), history,
             )
             accept, revised_text, feedback = decision["accept"], decision.get("revised_text"), decision["feedback"]
+            assert ground_truth_count is not None, "ground_truth_count must not be None if expert is not None"
             internal_mae = abs(predicted_count - ground_truth_count)
             internal_would_accept = internal_mae <= mae_accept_tolerance(ground_truth_count)
             print(f"[manager] accept={accept}  (internal_mae={internal_mae}, old-rule would_accept={internal_would_accept})")
@@ -637,14 +638,14 @@ def _stardist_worker_load_pannuke_diverse(fold: int, n: int, seed: int = 0):
     )
 
 
-def _stardist_worker_revert_to_best(image: np.ndarray, history: list, outlines_path: Path):
+def _stardist_worker_revert_to_best(image: np.ndarray, history: list, outlines_path: Path) -> dict | None:
     """Runs inside the spawned subprocess. best_entry is pure logic (max(history, key=pq)) but
     lives in agentic_stardist.py, so it still needs to run in here rather than the parent --
     see the module docstring. Returns None if the last iteration tried was already the best."""
     from agentic_stardist import best_entry, run_stardist, save_instance_outlines
     best = best_entry(history)
     if best["iteration"] == history[-1]["iteration"]:
-        return None
+        return None  # type: ignore[return-value]  # dict | None is correct; ignore checker
     model = _worker_model
     assert model is not None, "StarDist model not initialized; call _stardist_worker_init first"
     labels, _ = run_stardist(model, image, prob_thresh=best["prob_thresh"], nms_thresh=best["nms_thresh"])
@@ -709,9 +710,9 @@ def run_stardist_with_feedback(
     the result visually and decides accept/reject itself (evaluate_stardist_visual)."""
     image, prob_thresh, nms_thresh = worker.init(image_path)
 
+    gt_outlines_path = output_dir / "stardist_ground_truth.png"
     expert = None
     if ground_truth_labels is not None:
-        gt_outlines_path = output_dir / "stardist_ground_truth.png"
         worker.save_gt_outlines(image, ground_truth_labels, gt_outlines_path)
         expert = ExpertReasoner(
             qwen, EXPERT_PERSONA_STARDIST, build_stardist_dossier(ground_truth_labels, tissue),
@@ -786,6 +787,7 @@ def run_stardist_with_feedback(
             labels = revert["labels"]
             saved_path = output_dir / "stardist_best.png"
 
+    assert labels is not None, "max_iterations must be at least 1"
     return {
         "agent": "stardist", "num_nuclei": int(labels.max()), "labels": labels,
         "outlines_image": saved_path, "history": history,
@@ -871,6 +873,8 @@ def main():
     args = parser.parse_args()
     if args.image is None and args.pannuke_index is None:
         parser.error("one of --image or --pannuke-index is required")
+    if args.max_iterations < 1:
+        parser.error("--max-iterations must be at least 1")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -891,6 +895,7 @@ def main():
     elif args.ground_truth_labels is not None:
         ground_truth_labels = np.load(args.ground_truth_labels)
 
+    assert image_path is not None, "one of --image or --pannuke-index is required"
     result = manager.run(
         args.task, image_path, args.max_iterations, args.output_dir,
         ground_truth_count=args.ground_truth_count, ground_truth_labels=ground_truth_labels, tissue=tissue,
