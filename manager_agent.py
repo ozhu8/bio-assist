@@ -291,9 +291,13 @@ def decide_stardist_from_dialogue(
         f"Your conversation with the domain expert this iteration:\n{json.dumps(dialogue, default=str)}\n"
         f"Prior attempts this session: {json.dumps(history, default=str)}\n\n"
         "Based on the expert's reasoning and what you can see in the image yourself, decide "
-        "whether this segmentation satisfies the request. If not, propose revised threshold(s): "
-        "raise prob_thresh if the expert's answers suggest false-positive outlines on "
-        "background/noise, lower it if real nuclei sound missed; lower nms_thresh if outlines "
+        "whether this segmentation satisfies the request. Weigh both how accurate the existing "
+        "outlines are AND how complete the coverage is -- if the dialogue turned up spots that "
+        "look like real objects with no outline at all, that's a real failure even if every "
+        "existing outline is clean; don't accept just because what WAS detected looks correct. "
+        "If not accepted, propose revised threshold(s): raise prob_thresh if the expert's "
+        "answers suggest false-positive outlines on background/noise, lower it if real nuclei "
+        "sound missed (including the unmarked-spot cases above); lower nms_thresh if outlines "
         "sound duplicated/split around one nucleus, raise it if adjacent distinct nuclei sound "
         "merged. Only set the threshold(s) that address the problem -- leave the other null.\n\n"
         "Reply with ONLY a JSON object matching this schema: {\"accept\": bool, \"feedback\": str, "
@@ -482,10 +486,15 @@ def manager_ask_expert(
         "NOT have the ground-truth answer -- a domain expert does, but they will only explain "
         "their reasoning about specific things you ask, never give you a number or a verdict. "
         "Look at the image and ask ONE focused question about a specific region, detection, or "
-        "possible discrepancy you want the expert's judgment on -- e.g. whether a cluster looks "
-        "like one object or several, whether a faint region should count at all, whether two "
-        "adjacent outlines should be merged. Do not ask for the count or a yes/no verdict; ask "
-        "about a specific visual thing.\n\n"
+        "possible discrepancy you want the expert's judgment on. Consider BOTH kinds of mistake, "
+        "not just one: (a) an existing outline might be wrong -- e.g. whether a cluster looks "
+        "like one object or several, whether two adjacent outlines should be merged; and (b) the "
+        "specialist might have missed something entirely -- scan the image itself (not just the "
+        "outlines) for structures that look like they could be the object of interest but have no "
+        "outline around them at all, and ask the expert about those specific unmarked spots too. "
+        "A result with a few wrong outlines and a result that's missing a large fraction of the "
+        "objects are both failures worth catching. Do not ask for the count or a yes/no verdict; "
+        "ask about a specific visual thing.\n\n"
         f"Task: \"{task_description}\"\n"
         f"Specialist's result: {predicted_summary}\n"
         f"Conversation with the expert so far: {json.dumps(dialogue_so_far, default=str)}\n"
@@ -743,18 +752,23 @@ def run_stardist_with_feedback(
             revised_prob, revised_nms, feedback = decision.get("revised_prob_thresh"), decision.get("revised_nms_thresh"), decision["feedback"]
             pq_result = result["pq_result"]
             internal_would_accept = bool(pq_result["pq"] >= ACCEPT_PQ_THRESHOLD)
-            print(f"[manager] accept={accept}  (internal_pq={pq_result['pq']:.3f}, old-rule would_accept={internal_would_accept})")
+            tp, fn = pq_result["tp"], pq_result["fn"]
+            internal_recall = tp / (tp + fn) if (tp + fn) else 1.0  # coverage only -- see module docstring
+            print(f"[manager] accept={accept}  (internal_pq={pq_result['pq']:.3f}, "
+                  f"internal_recall={internal_recall:.3f}, old-rule would_accept={internal_would_accept})")
             history.append({
                 # pq/mean_iou/tp/fp/fn keep agentic_stardist.py's own field names (unprefixed) --
                 # best_entry() below (imported from that untouched module) keys off e["pq"] to pick
                 # which attempted iteration to report as final. None of this is shown to the
-                # manager or the expert; only internal_would_accept is new (the old threshold rule,
-                # logged for comparison against the manager's dialogue-driven `accept` above).
+                # manager or the expert; only internal_would_accept/internal_recall are new (the
+                # old threshold rule, and a coverage-only stat -- tp/(tp+fn), how much of the true
+                # object set was even found regardless of outline quality -- logged for comparison
+                # against the manager's dialogue-driven `accept` above, never used to decide it).
                 "iteration": i, "prob_thresh": prob_thresh, "nms_thresh": nms_thresh,
                 "predicted_count": predicted_count, "dialogue": dialogue, "accept": accept, "feedback": feedback,
                 "pq": pq_result["pq"], "mean_iou": pq_result["mean_iou"],
                 "tp": pq_result["tp"], "fp": pq_result["fp"], "fn": pq_result["fn"],
-                "internal_would_accept": internal_would_accept,
+                "internal_would_accept": internal_would_accept, "internal_recall": internal_recall,
             })
         else:
             eval_result = evaluate_stardist_visual(
