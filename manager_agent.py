@@ -105,6 +105,14 @@ STARDIST_CANDIDATE_FLOOR = 0.05
 STARDIST_COVERAGE_RATIO_MIN = 0.4  # below this fraction of floor-candidates kept, treat as suspicious
 STARDIST_COVERAGE_MIN_CANDIDATES = 5  # don't fire the guardrail on images with few candidates anyway
 
+# The model's own tuned default (0.692, from thresholds.json) consistently under-detects on
+# PanNuke: backing out true counts from internal_recall across a 2026-07-21 training run showed
+# ~20-43% of real nuclei missed at 0.692 across many different tissue types (Colon, Lung, Kidney,
+# Thyroid, Bladder, Pancreatic), not just isolated hard images -- so starting every trial at 0.692
+# means every retry loop spends its budget clawing back a shortfall baked in from iteration 1.
+# Starting lower gives iteration 1 a real shot at adequate coverage instead.
+STARDIST_INITIAL_PROB_THRESH = 0.5
+
 
 def mae_accept_tolerance(ground_truth_count: int) -> float:
     """Accept a CountGD result if its MAE is within this many counts of the ground truth --
@@ -501,6 +509,38 @@ class ExpertReasoner:
             return EXPERT_LEAK_FALLBACK
         return response
 
+    def summarize_for_manager(self, task_description: str, image_id: str, conversation: list) -> str:
+        """After a human reviewer talks through what's wrong with a result the automated loop
+        never got accepted, this turns that conversation into transferable tuning guidance for
+        the manager -- same leak-check discipline as answer() (the manager must never see the
+        ground-truth number/mask, only reasoning), applied here since summarizing a conversation
+        could in principle recombine details into the forbidden value even though each individual
+        turn already passed the same check."""
+        prompt = (
+            f"A human reviewer looked at the final {task_description} result for image "
+            f"{image_id!r} -- this was escalated because the automated retry loop never reached "
+            f"an acceptable result on its own -- and had this conversation with you:\n"
+            f"{json.dumps(conversation, default=str)}\n\n"
+            "Summarize in 2-4 sentences, for the manager (who will read this as tuning guidance "
+            "for future images and never sees the ground truth): what specifically was wrong, and "
+            "what adjustment approach would address it. Write it as general, transferable "
+            "guidance about image/tissue characteristics and threshold direction, not "
+            "image-specific trivia that won't generalize. No numbers from the private facts above."
+        )
+        response = self.qwen.ask_text(prompt, max_new_tokens=300).strip()
+        for _ in range(EXPERT_LEAK_MAX_RETRIES):
+            if not self._leaks_forbidden_value(response):
+                return response
+            response = self.qwen.ask_text(
+                prompt + f"\n\nYour previous summary stated a forbidden private number "
+                         f"(\"{response}\"). Try again, describing it in words only.",
+                max_new_tokens=300,
+            ).strip()
+        if self._leaks_forbidden_value(response):
+            print(f"    [expert] leaked the private ground-truth value while summarizing for the manager -- returning fallback instead")
+            return EXPERT_LEAK_FALLBACK
+        return response
+
 
 def manager_ask_expert(
     qwen: QwenVLM, task_description: str, predicted_summary: str, image_path: str,
@@ -553,9 +593,33 @@ def run_expert_dialogue(
     return dialogue
 
 
+def run_human_expert_dialogue(expert: ExpertReasoner, expert_image_paths: list, get_human_input) -> list:
+    """Human-driven counterpart to run_expert_dialogue, used to resolve an escalated case
+    (write_escalation) instead of the manager's own targeted Q&A: a human reviewer who has just
+    looked at the final output drives the conversation directly, describing what looks wrong or
+    asking the expert about a specific region. get_human_input is a callable (prompt: str) -> str
+    -- takes a prompt, returns the human's typed response -- injected rather than calling input()
+    directly here so this stays testable/reusable outside a real terminal. Ends when the human
+    enters an empty response. Reuses ExpertReasoner.answer() unchanged, treating the human's
+    free-form message the same way a manager's targeted question is treated -- same leak
+    protection applies since it's the same method."""
+    dialogue = []
+    while True:
+        human_message = get_human_input(
+            "Your feedback for the expert (what looks wrong, or a question) -- empty line to finish: "
+        )
+        if not human_message.strip():
+            break
+        answer = expert.answer(expert_image_paths, human_message, dialogue)
+        dialogue.append({"question": human_message, "answer": answer})
+        print(f"  [expert] {answer}")
+    return dialogue
+
+
 def run_countgd_with_feedback(
     qwen: QwenVLM, countgd_client: Client, image_path: str, task_description: str,
     max_iterations: int, output_dir: Path, ground_truth_count: int | None = None,
+    image_id: str | None = None,
 ) -> dict:
     """If ground_truth_count is given, it goes to a private ExpertReasoner (never to the
     manager) -- each iteration the manager gets a dialogue with it (run_expert_dialogue) and
@@ -563,7 +627,9 @@ def run_countgd_with_feedback(
     old MAE rule is still computed for history/logging only (internal_mae/internal_would_accept
     -- see module docstring), not used for the decision. Otherwise (no ground truth) there's no
     expert to consult, so Qwen scores the result visually and decides accept/reject itself
-    (evaluate_countgd_visual)."""
+    (evaluate_countgd_visual). If the loop never reaches accept=True, the case is queued for
+    human review (write_escalation) instead of silently shipping the last attempt -- requires
+    image_id."""
     count_target = interpret_countgd_target(qwen, task_description, image_path)
     print(f"[Qwen] counting target: {count_target!r}")
 
@@ -615,6 +681,11 @@ def run_countgd_with_feedback(
             break
         count_target = revised_text
 
+    if not history[-1]["accept"] and image_id is not None:
+        write_escalation(
+            output_dir, image_id, "countgd", task_description, image_path, saved_path, history,
+            ground_truth_count,
+        )
     return {
         "agent": "countgd", "count_target": count_target, "count": predicted_count,
         "annotated_image": saved_path, "history": history,
@@ -633,7 +704,7 @@ def _stardist_worker_init(image_path: str):
         _worker_model = StarDist2D.from_pretrained(PRETRAINED_MODEL)
     image = load_image(image_path)
     assert _worker_model is not None, "StarDist model failed to load"
-    return image, round(_worker_model.thresholds.prob, 3), round(_worker_model.thresholds.nms, 3)
+    return image, STARDIST_INITIAL_PROB_THRESH, round(_worker_model.thresholds.nms, 3)
 
 
 def _stardist_worker_run(image: np.ndarray, prob_thresh: float, nms_thresh: float,
@@ -734,9 +805,46 @@ class StardistWorker:
         self._pool.shutdown(wait=True)
 
 
+ESCALATION_QUEUE_DIRNAME = "escalation_queue"
+
+
+def write_escalation(
+    output_dir: Path, image_id: str, agent: str, task_description: str, original_image_path: str,
+    final_image_path: Path, history: list, ground_truth, tissue: str | None = None,
+) -> None:
+    """Queues a case for human review instead of silently accepting whatever the retry loop
+    landed on -- written when the automated loop exhausts max_iterations without ever reaching
+    accept=True. Deliberately a plain JSON file in a directory, not a real queue/broker: this is
+    a single-machine script, and a human resolves these later (resolve_escalations.py), on their
+    own time, without blocking the batch run that's still processing other images. ground_truth
+    is StarDist's instance-label ndarray or CountGD's int count -- saved alongside (as .npy for
+    the array case) purely so the later human<->expert conversation can reconstruct the same
+    ExpertReasoner. It's never shown to the human, same boundary as everywhere else in this
+    module."""
+    queue_dir = output_dir / ESCALATION_QUEUE_DIRNAME
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    ground_truth_path, ground_truth_value = None, None
+    if isinstance(ground_truth, np.ndarray):
+        ground_truth_path = queue_dir / f"{image_id}_gt.npy"
+        np.save(ground_truth_path, ground_truth)
+    elif ground_truth is not None:
+        ground_truth_value = ground_truth
+    record = {
+        "image_id": image_id, "agent": agent, "task_description": task_description,
+        "original_image_path": str(original_image_path), "final_image_path": str(final_image_path),
+        "history": history, "tissue": tissue,
+        "ground_truth_path": str(ground_truth_path) if ground_truth_path else None,
+        "ground_truth_value": ground_truth_value, "status": "pending",
+    }
+    record_path = queue_dir / f"{image_id}.json"
+    record_path.write_text(json.dumps(record, indent=2, default=str))
+    print(f"  [escalation] never reached an accepted result -- queued for human review at {record_path}")
+
+
 def run_stardist_with_feedback(
     qwen: QwenVLM, worker: StardistWorker, image_path: str, task_description: str,
     max_iterations: int, output_dir: Path, ground_truth_labels: np.ndarray | None = None, tissue: str | None = None,
+    image_id: str | None = None,
 ) -> dict:
     """If ground_truth_labels is given (a PanNuke-style instance mask), it goes to a private
     ExpertReasoner (never to the manager) along with a one-time outline rendering of the true
@@ -745,7 +853,9 @@ def run_stardist_with_feedback(
     transcript (decide_stardist_from_dialogue). The old PQ rule is still computed for
     history/logging only (internal_pq/internal_would_accept -- see module docstring), not used
     for the decision. Otherwise (no ground truth) there's no expert to consult, so Qwen scores
-    the result visually and decides accept/reject itself (evaluate_stardist_visual)."""
+    the result visually and decides accept/reject itself (evaluate_stardist_visual). If the loop
+    never reaches accept=True, the case is queued for human review (write_escalation) instead of
+    silently shipping whatever the last/best attempt was -- requires image_id."""
     image, prob_thresh, nms_thresh = worker.init(image_path)
 
     gt_outlines_path = output_dir / "stardist_ground_truth.png"
@@ -859,6 +969,11 @@ def run_stardist_with_feedback(
             saved_path = output_dir / "stardist_best.png"
 
     assert labels is not None, "max_iterations must be at least 1"
+    if not history[-1]["accept"] and image_id is not None:
+        write_escalation(
+            output_dir, image_id, "stardist", task_description, image_path, saved_path, history,
+            ground_truth_labels, tissue,
+        )
     return {
         "agent": "stardist", "num_nuclei": int(labels.max()), "labels": labels,
         "outlines_image": saved_path, "history": history,

@@ -74,7 +74,7 @@ def run_countgd_trial(manager: ManagerAgent, image_path: str, image_id: str, gro
                        max_iterations: int, output_dir: Path) -> dict:
     result = run_countgd_with_feedback(
         manager.qwen, manager.countgd_client, image_path, "count the individual cells",
-        max_iterations, output_dir, ground_truth_count=ground_truth_count,
+        max_iterations, output_dir, ground_truth_count=ground_truth_count, image_id=image_id,
     )
     return build_note(manager.qwen, "countgd", image_id, result["history"], result["annotated_image"],
                        lower_is_better=True)
@@ -84,7 +84,7 @@ def run_stardist_trial(manager: ManagerAgent, image_path: str, image_id: str, gr
                         max_iterations: int, output_dir: Path) -> dict:
     result = run_stardist_with_feedback(
         manager.qwen, manager.stardist_worker, image_path, "segment the individual nuclei",
-        max_iterations, output_dir, ground_truth_labels=ground_truth_labels,
+        max_iterations, output_dir, ground_truth_labels=ground_truth_labels, image_id=image_id,
     )
     return build_note(manager.qwen, "stardist", image_id, result["history"], result["outlines_image"],
                        lower_is_better=False)
@@ -141,6 +141,30 @@ def summarize_and_merge(qwen, running_prompt: str, batch: list, stats: dict) -> 
         "low-confidence), (2) what output characteristics tend to co-occur with a high vs. low "
         "score -- useful later when there's no ground truth to check against, (3) any "
         "image/input traits that consistently perform badly.\n"
+        "Reply with ONLY the updated notes as plain text (no JSON, no preamble) -- this text is "
+        "used directly as guidance in a future prompt."
+    )
+    return qwen.ask_text(prompt, max_new_tokens=800).strip()
+
+
+def merge_escalation_feedback(qwen, running_prompt: str, image_id: str, expert_summary: str) -> str:
+    """Escalation counterpart to summarize_and_merge: folds one human-informed correction (see
+    resolve_escalations.py) into the running prompt instead of a whole batch's stats. Same
+    keep-what-still-holds/drop-what's-contradicted framing, just triggered by a single flagged
+    case instead of every --batch-size images."""
+    prompt = (
+        "You are refining a running set of notes that will guide a manager agent (you, in a "
+        "future session) on how to route and tune two tools -- CountGD (counts objects) and "
+        "StarDist (segments nuclei) -- when no ground truth is available to score against.\n\n"
+        f"Current notes (may be empty):\n{running_prompt or '(none yet)'}\n\n"
+        f"Image {image_id!r} was escalated to a human reviewer because the automated retry loop "
+        f"never reached an acceptable result on its own. After looking at the final output, the "
+        f"human talked it through with the domain expert, who summarized the correction as:\n"
+        f"{expert_summary}\n\n"
+        "Update the notes to fold in this correction -- reinforcing it if it's consistent with "
+        "what's already there, or overriding/qualifying existing guidance if this contradicts it "
+        "(a human-confirmed correction should carry more weight than an unconfirmed pattern from "
+        "batch stats alone). Keep it general/transferable, not specific to this one image.\n"
         "Reply with ONLY the updated notes as plain text (no JSON, no preamble) -- this text is "
         "used directly as guidance in a future prompt."
     )
