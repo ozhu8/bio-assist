@@ -93,6 +93,18 @@ ACCEPT_PQ_THRESHOLD = 0.5   # old PQ rule, kept only to log internal_would_accep
 MAE_TOLERANCE_FRACTION = 0.1  # old MAE rule, kept only to log internal_would_accept -- see module docstring
 MAX_EXPERT_TURNS = 3  # cap on manager<->expert question/answer turns per iteration
 
+# Ground-truth-free sanity check for StarDist: how many instances would survive at a much
+# more permissive probability floor (same nms_thresh) vs. how many actually survived
+# prob_thresh. A huge gap means detection is suspiciously sparse for this image regardless
+# of what the 3-turn expert dialogue happened to probe -- it can't ask about nuclei it never
+# had a reason to point at, so a manager relying only on the dialogue transcript is blind to
+# this exact failure mode (observed: 10 kept vs a much larger candidate pool on a PanNuke
+# image where true recall was 0.045 -- the dialogue's 3 questions all landed on already-
+# correct regions and came back "no_issue", so nothing in the transcript flagged it).
+STARDIST_CANDIDATE_FLOOR = 0.05
+STARDIST_COVERAGE_RATIO_MIN = 0.4  # below this fraction of floor-candidates kept, treat as suspicious
+STARDIST_COVERAGE_MIN_CANDIDATES = 5  # don't fire the guardrail on images with few candidates anyway
+
 
 def mae_accept_tolerance(ground_truth_count: int) -> float:
     """Accept a CountGD result if its MAE is within this many counts of the ground truth --
@@ -222,9 +234,9 @@ def evaluate_countgd_visual(
         "prompt would plausibly fix it, set accept=false and give revised_text to retry with. "
         "Otherwise set accept=true and revised_text=null.\n\n"
         "Reply with ONLY a JSON object matching this schema: "
-        "{\"accept\": bool, \"score\": int, \"feedback\": str, \"revised_text\": str or null}"
+        "{\"accept\": bool, \"score\": int, \"feedback\": str (1-2 sentences), \"revised_text\": str or null}"
     )
-    return qwen.ask_json(annotated_image_path, prompt, required_keys=["accept", "score", "feedback"])
+    return qwen.ask_json(annotated_image_path, prompt, max_new_tokens=768, required_keys=["accept", "score", "feedback"])
 
 
 def decide_countgd_from_dialogue(
@@ -245,9 +257,9 @@ def decide_countgd_from_dialogue(
         "text prompt for CountGD to retry with, informed by what the expert pointed out (e.g. "
         "overlapping cells, faint/out-of-focus cells, background clutter).\n\n"
         "Reply with ONLY a JSON object matching this schema: "
-        "{\"accept\": bool, \"feedback\": str, \"revised_text\": str or null}"
+        "{\"accept\": bool, \"feedback\": str (1-2 sentences), \"revised_text\": str or null}"
     )
-    return qwen.ask_json(annotated_image_path, prompt, required_keys=["accept", "feedback"])
+    return qwen.ask_json(annotated_image_path, prompt, max_new_tokens=768, required_keys=["accept", "feedback"])
 
 
 def evaluate_stardist_visual(
@@ -272,9 +284,9 @@ def evaluate_stardist_visual(
         "the threshold(s) that address the problem -- leave the other null. Otherwise set "
         "accept=true and leave both revised fields null.\n\n"
         "Reply with ONLY a JSON object matching this schema: {\"accept\": bool, \"score\": int, "
-        "\"feedback\": str, \"revised_prob_thresh\": number or null, \"revised_nms_thresh\": number or null}"
+        "\"feedback\": str (1-2 sentences), \"revised_prob_thresh\": number or null, \"revised_nms_thresh\": number or null}"
     )
-    return qwen.ask_json(outlines_image_path, prompt, required_keys=["accept", "score", "feedback"])
+    return qwen.ask_json(outlines_image_path, prompt, max_new_tokens=768, required_keys=["accept", "score", "feedback"])
 
 
 def decide_stardist_from_dialogue(
@@ -290,20 +302,33 @@ def decide_stardist_from_dialogue(
         f"Detected nuclei: {predicted_count}\n"
         f"Your conversation with the domain expert this iteration:\n{json.dumps(dialogue, default=str)}\n"
         f"Prior attempts this session: {json.dumps(history, default=str)}\n\n"
-        "Based on the expert's reasoning and what you can see in the image yourself, decide "
-        "whether this segmentation satisfies the request. Weigh both how accurate the existing "
-        "outlines are AND how complete the coverage is -- if the dialogue turned up spots that "
-        "look like real objects with no outline at all, that's a real failure even if every "
-        "existing outline is clean; don't accept just because what WAS detected looks correct. "
-        "If not accepted, propose revised threshold(s): raise prob_thresh if the expert's "
-        "answers suggest false-positive outlines on background/noise, lower it if real nuclei "
-        "sound missed (including the unmarked-spot cases above); lower nms_thresh if outlines "
-        "sound duplicated/split around one nucleus, raise it if adjacent distinct nuclei sound "
-        "merged. Only set the threshold(s) that address the problem -- leave the other null.\n\n"
-        "Reply with ONLY a JSON object matching this schema: {\"accept\": bool, \"feedback\": str, "
+        "First, classify each numbered turn in the conversation above as exactly one of: "
+        "missed_object (expert confirmed a real object was missed), false_positive (expert "
+        "suggested an outlined/detected region isn't actually a real nucleus), no_issue (expert "
+        "confirmed the existing segmentation was correct there), or ambiguous. List these as "
+        "turn_analysis.\n\n"
+        "Then decide whether this segmentation satisfies the request. Coverage does not need to "
+        "be perfect -- a clear majority of real nuclei captured with reasonably accurate outlines "
+        "is acceptable, even if the dialogue turned up one isolated missed spot or minor outline "
+        "issue. Use your turn_analysis tally as the basis: only reject on coverage grounds if "
+        "missed_object verdicts make up the majority of the turns (i.e. most of what the dialogue "
+        "surfaced was missed real objects, not just one one-off), or reject on accuracy grounds if "
+        "outlines are clearly poor (frequent false positives, merges, or splits). Don't reject "
+        "solely because of a single ambiguous or missed spot when everything else checks out.\n\n"
+        "If not accepted, base your threshold direction on the turn_analysis tally, not a guess: "
+        "if missed_object turns outnumber false_positive turns, LOWER prob_thresh (more permissive "
+        "-- catches more candidates); if false_positive turns outnumber missed_object turns, RAISE "
+        "prob_thresh (stricter -- drops spurious detections); lower nms_thresh if outlines sound "
+        "duplicated/split around one nucleus, raise it if adjacent distinct nuclei sound merged. "
+        "You MUST set at least one of revised_prob_thresh/revised_nms_thresh to a number that "
+        "actually differs from its current value above -- never leave both null, and never repeat "
+        "the current value, when accept is false.\n\n"
+        "Reply with ONLY a JSON object matching this schema: {\"turn_analysis\": "
+        "[{\"turn\": int, \"verdict\": \"missed_object\"|\"false_positive\"|\"no_issue\"|\"ambiguous\"}], "
+        "\"accept\": bool, \"feedback\": str (1-2 sentences), "
         "\"revised_prob_thresh\": number or null, \"revised_nms_thresh\": number or null}"
     )
-    return qwen.ask_json(outlines_image_path, prompt, required_keys=["accept", "feedback"])
+    return qwen.ask_json(outlines_image_path, prompt, max_new_tokens=900, required_keys=["accept", "feedback"])
 
 
 EXPERT_PERSONA_COUNTGD = (
@@ -621,7 +646,11 @@ def _stardist_worker_run(image: np.ndarray, prob_thresh: float, nms_thresh: floa
     labels, _ = run_stardist(model, image, prob_thresh=prob_thresh, nms_thresh=nms_thresh)
     save_instance_outlines(image, labels, outlines_path)
     pq_result = compute_panoptic_quality(labels, gt_labels) if gt_labels is not None else None
-    return {"labels": labels, "pq_result": pq_result}
+    # See STARDIST_CANDIDATE_FLOOR docstring above -- a second, cheap forward pass at a
+    # permissive floor, used only as a ground-truth-free sparse-detection sanity check.
+    floor_labels, _ = run_stardist(model, image, prob_thresh=STARDIST_CANDIDATE_FLOOR, nms_thresh=nms_thresh)
+    candidate_count = int(floor_labels.max())
+    return {"labels": labels, "pq_result": pq_result, "candidate_count": candidate_count}
 
 
 def _stardist_worker_load_pannuke(fold: int, index: int):
@@ -739,6 +768,16 @@ def run_stardist_with_feedback(
         predicted_count = int(labels.max())
         print(f"[StarDist] nuclei={predicted_count}")
 
+        candidate_count = result["candidate_count"]
+        coverage_ratio = predicted_count / max(candidate_count, 1)
+        guardrail_triggered = (
+            candidate_count >= STARDIST_COVERAGE_MIN_CANDIDATES and coverage_ratio < STARDIST_COVERAGE_RATIO_MIN
+        )
+        if guardrail_triggered:
+            print(f"  [guardrail] only {predicted_count}/{candidate_count} candidates kept at "
+                  f"prob_thresh={prob_thresh:.3f} (floor={STARDIST_CANDIDATE_FLOOR} finds {candidate_count}) "
+                  f"-- overriding accept=False and forcing prob_thresh down regardless of the dialogue")
+
         if expert is not None:
             dialogue = run_expert_dialogue(
                 qwen, expert, task_description,
@@ -750,6 +789,11 @@ def run_stardist_with_feedback(
             )
             accept = decision["accept"]
             revised_prob, revised_nms, feedback = decision.get("revised_prob_thresh"), decision.get("revised_nms_thresh"), decision["feedback"]
+            if guardrail_triggered:
+                accept = False
+                revised_prob = max(STARDIST_CANDIDATE_FLOOR, prob_thresh - (prob_thresh - STARDIST_CANDIDATE_FLOOR) * 0.5)
+                feedback = (f"[guardrail override] {predicted_count}/{candidate_count} candidates kept -- "
+                             f"detection looks suspiciously sparse regardless of dialogue content. {feedback}")
             pq_result = result["pq_result"]
             internal_would_accept = bool(pq_result["pq"] >= ACCEPT_PQ_THRESHOLD)
             tp, fn = pq_result["tp"], pq_result["fn"]
@@ -776,12 +820,25 @@ def run_stardist_with_feedback(
             )
             accept = eval_result["accept"]
             revised_prob, revised_nms, feedback = eval_result.get("revised_prob_thresh"), eval_result.get("revised_nms_thresh"), eval_result["feedback"]
+            if guardrail_triggered:
+                accept = False
+                revised_prob = max(STARDIST_CANDIDATE_FLOOR, prob_thresh - (prob_thresh - STARDIST_CANDIDATE_FLOOR) * 0.5)
+                feedback = (f"[guardrail override] {predicted_count}/{candidate_count} candidates kept -- "
+                             f"detection looks suspiciously sparse. {feedback}")
             print(f"[Qwen eval] score={eval_result['score']} accept={accept}")
             history.append({
                 "iteration": i, "prob_thresh": prob_thresh, "nms_thresh": nms_thresh,
                 "predicted_count": predicted_count, "score": eval_result["score"],
                 "accept": accept, "feedback": feedback,
             })
+
+        # A "revision" that repeats the current value changes nothing -- treat it as no
+        # revision at all rather than burning an iteration re-running identical thresholds
+        # (observed: manager proposed prob_thresh=0.692 when already at 0.692).
+        if revised_prob is not None and abs(revised_prob - prob_thresh) < 1e-9:
+            revised_prob = None
+        if revised_nms is not None and abs(revised_nms - nms_thresh) < 1e-9:
+            revised_nms = None
 
         if accept or (revised_prob is None and revised_nms is None):
             break

@@ -44,7 +44,6 @@ Usage:
 import argparse
 import base64
 import contextlib
-import io
 import json
 import mimetypes
 import random
@@ -161,16 +160,20 @@ PANNUKE_HTTP_BLOCK_SIZE = 512 * 1024
 
 @contextlib.contextmanager
 def _open_pannuke_zip(fold: int, block_size: int | None = None):
-    """fsspec's default HTTP block size (~5MB) is what PanNuke's server actually times
-    out mid-transfer on -- observed failing at a consistent ~4.2-4.6MB into a ~5MB block
-    regardless of how small a chunk_size Python-level .read() calls request, since that
-    caching/prefetch layer sits below the read() call. A much smaller block_size here
-    makes each underlying HTTP range request small enough to reliably complete.
+    """Passes the fsspec HTTP file handle straight to zipfile.ZipFile instead of calling
+    fp.read() to materialize it into an in-memory buffer first -- zipfile only seeks/reads
+    the central directory plus whatever members are actually opened, so this never downloads
+    the full ~700MB+ zip (confirmed: listing members + reading types.npy this way takes
+    under 4s). An earlier version here called fp.read() unconditionally, which *did* pull
+    the entire remote zip into memory with no retry around it -- that unbounded whole-file
+    read, not the per-block HTTP chunk size, is what was actually producing FSTimeoutError
+    (fp.read() has no size limit, so one dropped connection anywhere across a many-hundred-MB
+    transfer aborted the whole thing). block_size still controls the chunk size of the range
+    requests zipfile issues internally when reading a member.
     Context manager so the underlying fsspec HTTP handle (which ZipFile.close() does not
     close, since it didn't open the path itself) always gets closed too."""
     with fsspec.open(PANNUKE_FOLD_URL.format(fold=fold), mode="rb", block_size=block_size) as fp:  # type: ignore[assignment]
-        data = fp.read()  # type: ignore[attr-defined]
-        zf = zipfile.ZipFile(io.BytesIO(data))
+        zf = zipfile.ZipFile(fp)  # type: ignore[arg-type]
         try:
             yield zf
         finally:
@@ -197,7 +200,7 @@ def load_pannuke_types(fold: int) -> list:
     """Fetch every image's tissue-type label for a fold in one shot -- types.npy is a few
     KB, independent of the multi-GB images.npy/masks.npy streams, so this lets diverse
     sampling see the whole fold's tissue layout without paying for image/mask data."""
-    with _open_pannuke_zip(fold) as zf:
+    with _open_pannuke_zip(fold, block_size=PANNUKE_HTTP_BLOCK_SIZE) as zf:
         with zf.open(f"Fold {fold}/images/fold{fold}/types.npy") as tf:
             _, _, dtype = _read_npy_header(tf)
             types = np.frombuffer(tf.read(), dtype=dtype)

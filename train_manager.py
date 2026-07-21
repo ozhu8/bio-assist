@@ -22,6 +22,7 @@ Usage:
 """
 import argparse
 import json
+from itertools import zip_longest
 from pathlib import Path
 
 from PIL import Image # pyright: ignore[reportMissingImports]
@@ -33,7 +34,7 @@ from manager_agent import ManagerAgent, MODEL_ID, run_countgd_with_feedback, run
 def build_note(qwen, agent: str, image_id: str, history: list, final_image_path, lower_is_better: bool) -> dict:
     """Turns one image's existing retry-loop history (already produced by
     run_countgd_with_feedback / run_stardist_with_feedback) into a structured training note."""
-    metric_key = "mae" if agent == "countgd" else "pq"
+    metric_key = "internal_mae" if agent == "countgd" else "pq"
     initial_score = history[0][metric_key]
     final_score = history[-1][metric_key]
     accepted = bool(history[-1]["accept"])
@@ -176,6 +177,19 @@ def build_stardist_tasks(manager: ManagerAgent, n: int, fold: int, output_dir: P
     return tasks
 
 
+def interleave_tasks(countgd_tasks: list, stardist_tasks: list) -> list:
+    """Round-robins the two agents' tasks instead of running all of one before any of the
+    other, so a time-boxed run that gets cut short still has both agents represented
+    proportionally instead of the cutoff landing entirely inside whichever list came first."""
+    tasks = []
+    for a, b in zip_longest(countgd_tasks, stardist_tasks):
+        if a is not None:
+            tasks.append(a)
+        if b is not None:
+            tasks.append(b)
+    return tasks
+
+
 def save_checkpoint(path: Path, notes: list, running_prompt: str, total_tasks: int) -> None:
     completed_ids = [n["image_id"] for n in notes]
     path.write_text(json.dumps({
@@ -209,9 +223,9 @@ def main():
     checkpoint_path = output_dir / "checkpoint.json"
 
     manager = ManagerAgent(model_id=args.model_id)
-    tasks = (
-        build_countgd_tasks(args.countgd_n, output_dir)
-        + build_stardist_tasks(manager, args.stardist_n, args.pannuke_fold, output_dir)
+    tasks = interleave_tasks(
+        build_countgd_tasks(args.countgd_n, output_dir),
+        build_stardist_tasks(manager, args.stardist_n, args.pannuke_fold, output_dir),
     )
     if not tasks:
         parser.error("at least one of --countgd-n / --stardist-n must be > 0")
