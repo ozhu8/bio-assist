@@ -52,15 +52,15 @@ def resolve_one(qwen: QwenVLM, record_path: Path, record: dict, checkpoint_path:
     print("Open the image above yourself to look at it before responding.\n")
 
     if record["agent"] == "stardist":
-        ground_truth_labels = np.load(record["ground_truth_path"]) if record.get("ground_truth_path") else None
+        ground_truth_labels = np.load(record["ground_truth_path"]) if record.get("ground_truth_path") else np.array([])
         expert = ExpertReasoner(
             qwen, EXPERT_PERSONA_STARDIST, build_stardist_dossier(ground_truth_labels, record.get("tissue")),
-            forbidden_values=[int(ground_truth_labels.max())] if ground_truth_labels is not None else [],
+            forbidden_values=[int(ground_truth_labels.max())] if ground_truth_labels.size > 0 else [],
         )
     else:
         ground_truth_count = record.get("ground_truth_value")
         expert = ExpertReasoner(
-            qwen, EXPERT_PERSONA_COUNTGD, build_countgd_dossier(ground_truth_count, record["original_image_path"]),
+            qwen, EXPERT_PERSONA_COUNTGD, build_countgd_dossier(ground_truth_count or 0, record["original_image_path"]),
             forbidden_values=[ground_truth_count] if ground_truth_count is not None else [],
         )
 
