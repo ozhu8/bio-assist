@@ -90,7 +90,7 @@ def load_patch(image_path: str) -> Image.Image:
     true proportions.
     """
     image = Image.open(image_path).convert("RGB")
-    image.thumbnail((PATCH_SIZE, PATCH_SIZE), Image.LANCZOS)
+    image.thumbnail((PATCH_SIZE, PATCH_SIZE), Image.Resampling.LANCZOS)
     canvas = Image.new("RGB", (PATCH_SIZE, PATCH_SIZE))
     offset = ((PATCH_SIZE - image.width) // 2, (PATCH_SIZE - image.height) // 2)
     canvas.paste(image, offset)
