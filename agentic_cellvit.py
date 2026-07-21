@@ -81,14 +81,37 @@ def image_to_content_block(image_path: str) -> ImageBlockParam:
     )
 
 
+def load_patch(image_path: str) -> Image.Image:
+    """Load an image as a PATCH_SIZE x PATCH_SIZE patch, preserving aspect ratio.
+
+    Resizing directly to a square would stretch non-square inputs, distorting
+    nucleus shapes before segmentation. Instead, downscale to fit within
+    PATCH_SIZE and letterbox (center on a black canvas) so cells keep their
+    true proportions.
+    """
+    image = Image.open(image_path).convert("RGB")
+    image.thumbnail((PATCH_SIZE, PATCH_SIZE), Image.LANCZOS)
+    canvas = Image.new("RGB", (PATCH_SIZE, PATCH_SIZE))
+    offset = ((PATCH_SIZE - image.width) // 2, (PATCH_SIZE - image.height) // 2)
+    canvas.paste(image, offset)
+    return canvas
+
+
+def autocast_device_type(inferer) -> str:
+    """Derive the torch.autocast device_type from the inferer's actual device
+    instead of assuming CUDA, so CPU-only inference doesn't crash."""
+    device = inferer.device
+    return getattr(device, "type", str(device).split(":")[0])
+
+
 def run_cellvit(inferer, image_path: str, magnification: float, target_classes: set, prob_threshold: float, color_dict: dict):
     """Run one CellViT forward pass, treating the whole image as a single 1024x1024 patch."""
-    image = Image.open(image_path).convert("RGB").resize((PATCH_SIZE, PATCH_SIZE))
+    image = load_patch(image_path)
     patch = inferer.inference_transforms(image).unsqueeze(0).to(inferer.device)
 
     with torch.no_grad():
         if inferer.mixed_precision:
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
+            with torch.autocast(device_type=autocast_device_type(inferer), dtype=torch.float16):
                 predictions = inferer.model.forward(patch, retrieve_tokens=True)
         else:
             predictions = inferer.model.forward(patch, retrieve_tokens=True)
@@ -138,12 +161,12 @@ def run_raw_inference(inferer, image_path: str, magnification: float):
     """One forward pass with no class-filtering or annotation overlay: returns
     CellViT's own raw output, the instance map (per-pixel nucleus IDs, 0 =
     background) and per-nucleus type dicts from model.calculate_instance_map."""
-    image = Image.open(image_path).convert("RGB").resize((PATCH_SIZE, PATCH_SIZE))
+    image = load_patch(image_path)
     patch = inferer.inference_transforms(image).unsqueeze(0).to(inferer.device)
 
     with torch.no_grad():
         if inferer.mixed_precision:
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
+            with torch.autocast(device_type=autocast_device_type(inferer), dtype=torch.float16):
                 predictions = inferer.model.forward(patch, retrieve_tokens=True)
         else:
             predictions = inferer.model.forward(patch, retrieve_tokens=True)
@@ -244,10 +267,17 @@ def evaluate_result(
                         "score": {"type": "integer"},
                         "feedback": {"type": "string"},
                         "revised_target_classes": {
-                            "type": ["array", "null"],
-                            "items": {"type": "string", "enum": NUCLEI_CLASSES},
+                            "anyOf": [
+                                {
+                                    "type": "array",
+                                    "items": {"type": "string", "enum": NUCLEI_CLASSES},
+                                },
+                                {"type": "null"},
+                            ],
                         },
-                        "revised_prob_threshold": {"type": ["number", "null"]},
+                        "revised_prob_threshold": {
+                            "anyOf": [{"type": "number"}, {"type": "null"}],
+                        },
                     },
                     "required": ["accept", "score", "feedback", "revised_target_classes", "revised_prob_threshold"],
                     "additionalProperties": False,
