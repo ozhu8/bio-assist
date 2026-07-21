@@ -682,6 +682,7 @@ def run_countgd_with_feedback(
         count_target = revised_text
 
     if not history[-1]["accept"] and image_id is not None:
+        assert saved_path is not None, "saved_path must not be None if history has entries"
         write_escalation(
             output_dir, image_id, "countgd", task_description, image_path, saved_path, history,
             ground_truth_count,
@@ -970,6 +971,7 @@ def run_stardist_with_feedback(
 
     assert labels is not None, "max_iterations must be at least 1"
     if not history[-1]["accept"] and image_id is not None:
+        assert saved_path is not None, "saved_path must not be None when writing escalation"
         write_escalation(
             output_dir, image_id, "stardist", task_description, image_path, saved_path, history,
             ground_truth_labels, tissue,
