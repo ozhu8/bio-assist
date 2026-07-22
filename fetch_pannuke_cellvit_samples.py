@@ -41,7 +41,8 @@ def _open_pannuke_zip(fold: int, block_size: int | None = None):
     zip into memory with no retry around it -- that unbounded whole-file read (not the
     per-block HTTP chunk size) is what produces FSTimeoutError, since one dropped connection
     anywhere across a many-hundred-MB transfer aborts the whole thing (see agentic_stardist.py's
-    equivalent function, which hit and fixed the same bug this duplicates the fetch logic from).
+    equivalent function, which hit and fixed the same bug this duplicates the fetch logic from
+    -- independently hit and fixed the same way here too, converging on the same fix).
     Context manager so the underlying fsspec HTTP handle (which ZipFile.close() does not close,
     since it didn't open the path itself) always gets closed too."""
     with fsspec.open(PANNUKE_FOLD_URL.format(fold=fold), mode="rb", block_size=block_size) as fp:  # type: ignore[assignment]
@@ -139,6 +140,8 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-dir", default="pannuke_cellvit_samples")
     args = parser.parse_args()
+    if args.n < 1:
+        parser.error("--n must be at least 1")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

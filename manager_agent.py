@@ -881,6 +881,7 @@ def run_countgd_with_feedback(
     # whenever choose_best_output reverted to an earlier iteration.
     chosen_entry = next(h for h in history if h["iteration"] == chosen_iteration)
     if not chosen_entry["accept"] and image_id is not None:
+        assert saved_path is not None, "saved_path must not be None if history has entries"
         write_escalation(
             output_dir, image_id, "countgd", task_description, image_path, saved_path, history,
             ground_truth_count,
@@ -1309,6 +1310,7 @@ def run_stardist_with_feedback(
     # whenever choose_best_output reverted to an earlier iteration.
     chosen_entry = next(h for h in history if h["iteration"] == chosen_iteration)
     if not chosen_entry["accept"] and image_id is not None:
+        assert saved_path is not None, "saved_path must not be None when writing escalation"
         write_escalation(
             output_dir, image_id, "stardist", task_description, image_path, saved_path, history,
             ground_truth_labels, tissue,
