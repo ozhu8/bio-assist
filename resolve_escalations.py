@@ -23,6 +23,7 @@ Usage:
 import argparse
 import json
 from pathlib import Path
+from typing import Any, Dict
 
 import numpy as np  # pyright: ignore[reportMissingImports]
 
@@ -50,7 +51,7 @@ def load_pending(queue_dir: Path) -> list:
     return records
 
 
-def resolve_one(qwen: QwenVLM, record_path: Path, record: dict, checkpoint_path: Path) -> None:
+def resolve_one(qwen: QwenVLM, record_path: Path, record: Dict, checkpoint_path: Path) -> None:
     image_id = record["image_id"]
     print(f"\n=== Escalation: {image_id} ({record['agent']}) ===")
     print(f"Task: {record['task_description']}")

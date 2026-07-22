@@ -134,7 +134,14 @@ def mae_accept_tolerance(ground_truth_count: int) -> float:
 
 
 class QwenVLM:
-    """Lazily loads Qwen3-VL and answers single image+text prompts with it."""
+    """Lazily loads Qwen3-VL and answers single image+text prompts with it.
+
+    Deliberately NOT imported from agentic_cellvit.QwenVLM (which looks like the same class) --
+    that one is intentionally trimmed to only the ask/ask_json methods agentic_cellvit.py itself
+    needs (see its own docstring), missing ask_images/ask_json_multi/ask_text that ExpertReasoner/
+    choose_best_output/train_manager.py all depend on here. Importing agentic_cellvit at this
+    module's top level would also pull in torch, which the comment above (module-level import
+    section) explains crashes StardistWorker's spawned subprocess -- confirmed the hard way."""
 
     def __init__(self, model_id: str = MODEL_ID, device_map: str = "auto"):
         self.model_id = model_id
@@ -718,7 +725,7 @@ class ExpertReasoner:
             )
             response = self.qwen.ask_images(image_paths, prompt + f"\n\n{retry_notice}", max_new_tokens=150).strip()
         if self._leaks_forbidden_value(response):
-            print(f"    [expert] leaked the private ground-truth value while forming a question -- returning fallback instead")
+            print("    [expert] leaked the private ground-truth value while forming a question -- returning fallback instead")
             return "Looking at the final result -- is there a region where the detections look wrong to you?"
         return response
 
@@ -750,7 +757,7 @@ class ExpertReasoner:
                 max_new_tokens=300,
             ).strip()
         if self._leaks_forbidden_value(response):
-            print(f"    [expert] leaked the private ground-truth value while summarizing for the manager -- returning fallback instead")
+            print("    [expert] leaked the private ground-truth value while summarizing for the manager -- returning fallback instead")
             return EXPERT_LEAK_FALLBACK
         return response
 
@@ -1204,6 +1211,7 @@ class CellvitClient:
     def run(self, image_path: str, target_classes: set, prob_threshold: float):
         from agentic_cellvit import run_cellvit
         inferer, color_dict = self._load()
+        assert color_dict is not None, "color_dict failed to load"
         return run_cellvit(inferer, image_path, self.magnification, target_classes, prob_threshold, color_dict)
 
 
@@ -1457,7 +1465,7 @@ def run_cellvit_with_feedback(
     qwen: QwenVLM, cellvit_client: CellvitClient, image_path: str, task_description: str,
     max_iterations: int, output_dir: Path,
     ground_truth_counts_by_type: dict | None = None, ground_truth_class_labels: dict | None = None,
-    stardist_worker: "StardistWorker | None" = None, tissue: str | None = None, image_id: str | None = None,
+    stardist_worker: StardistWorker | None = None, tissue: str | None = None, image_id: str | None = None,
 ) -> dict:
     """The manager always consults a private ExpertReasoner (never shown ground truth itself --
     see module docstring) via a multi-turn dialogue (run_expert_dialogue) and decides
@@ -1478,8 +1486,8 @@ def run_cellvit_with_feedback(
     compute_panoptic_quality lives in agentic_stardist.py, which this file only ever imports
     inside StarDist's TensorFlow-loaded subprocess (see StardistWorker's own docstring);
     reusing that machinery instead of duplicating PQ-scoring logic a third time."""
-    from agentic_cellvit import interpret_request as interpret_cellvit_request
-    request = interpret_cellvit_request(qwen, task_description, image_path)
+    import agentic_cellvit as cellvit_module
+    request = cellvit_module.interpret_request(qwen, task_description, image_path)
     target_classes = set(request["target_classes"])
     prob_threshold = request["prob_threshold"]
     print(f"[Qwen] target classes: {sorted(target_classes)}, prob_threshold={prob_threshold:.2f}")
@@ -1574,6 +1582,7 @@ def run_cellvit_with_feedback(
 
     chosen_entry = next(h for h in history if h["iteration"] == chosen_iteration)
     if not chosen_entry["accept"] and image_id is not None:
+        assert saved_path is not None, "saved_path must not be None when writing escalation"
         write_escalation(
             output_dir, image_id, "cellvit", task_description, image_path, saved_path, history,
             ground_truth_counts_by_type, tissue,
@@ -1859,6 +1868,8 @@ def main():
     args = parser.parse_args()
     if args.image is None and args.pannuke_index is None and args.slide is None:
         parser.error("one of --image, --pannuke-index, or --slide is required")
+    if args.slide is not None and args.pannuke_index is not None:
+        parser.error("--slide and --pannuke-index are mutually exclusive")
     if args.max_iterations < 1:
         parser.error("--max-iterations must be at least 1")
 

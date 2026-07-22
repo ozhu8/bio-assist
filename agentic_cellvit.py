@@ -39,7 +39,7 @@ import json
 import sys
 import textwrap
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Protocol
 
 import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
 import numpy as np # pyright: ignore[reportMissingImports]
@@ -112,7 +112,16 @@ class QwenVLM:
         return result
 
 
-def load_cellvit_module(cellvit_repo: str):
+class AsksJSON(Protocol):
+    """Structural type for interpret_request/evaluate_result below -- both only ever call
+    ask_json, so this accepts this module's own QwenVLM as well as manager_agent.QwenVLM (a
+    structural superset with more methods this module doesn't need) without either module
+    importing the other's class."""
+
+    def ask_json(self, image_path: str, prompt: str, max_new_tokens: int = 512, required_keys: Optional[list] = None) -> dict: ...
+
+
+def load_cellvit_module(cellvit_repo: Optional[str]):
     """Import CellViT's inference class, adding its repo to sys.path first if given."""
     if cellvit_repo:
         sys.path.insert(0, str(Path(cellvit_repo).resolve()))
@@ -251,7 +260,7 @@ def run_raw_inference(inferer, image_path: str, magnification: float):
     return instance_map, nuclei
 
 
-def interpret_request(qwen: QwenVLM, user_prompt: str, image_path: str) -> dict:
+def interpret_request(qwen: AsksJSON, user_prompt: str, image_path: str) -> dict:
     prompt = (
         "CellViT classifies nuclei in histopathology images into exactly five "
         f"fixed classes: {', '.join(NUCLEI_CLASSES)}. The user wants: "
@@ -274,7 +283,7 @@ def interpret_request(qwen: QwenVLM, user_prompt: str, image_path: str) -> dict:
 
 
 def evaluate_result(
-    qwen: QwenVLM,
+    qwen: AsksJSON,
     user_prompt: str,
     target_classes: list,
     prob_threshold: float,
