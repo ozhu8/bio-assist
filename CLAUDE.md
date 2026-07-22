@@ -122,8 +122,21 @@ subsequent runs.
 ```
 python -m venv .venv-manager
 .venv-manager/bin/pip install transformers accelerate qwen-vl-utils pillow gradio_client anthropic stardist csbdeep tensorflow aiohttp
+.venv-manager/bin/pip install pandas tqdm ujson einops pandarallel shapely opencv-python-headless numba pyyaml
 .venv-manager/bin/pip install --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ torch torchvision
 ```
+The second `pip install` line (`pandas`/`tqdm`/`ujson`/`einops`/`pandarallel`/`shapely`/
+`opencv-python-headless`/`numba`/`pyyaml`) is for CellViT support (`agentic_cellvit.py`,
+integrated into `manager_agent.py` 2026-07-22) -- the concrete net-new packages
+`cell_segmentation.inference.cell_detection`'s actual import chain needs, on top of what's
+already installed above for StarDist/Qwen. **Do NOT `pip install -r CellViT/requirements.txt`
+here** -- it pins `tensorflow==2.12.0`, `numpy<1.24`, `stardist==0.8.5`, `keras==2.12.0`, which
+will very likely fight the newer versions already resolved in this venv for its existing
+StarDist support. If a further `ModuleNotFoundError` turns up when importing CellViT beyond
+this list, install that one specific package rather than the full requirements.txt; watch
+especially for numpy-version friction (deprecated aliases like `np.float`/`np.bool`, removed in
+newer numpy than CellViT was pinned against) and fix the specific call site rather than
+downgrading numpy repo-wide.
 `torchvision` is needed too -- `qwen_vl_utils` imports it at module load time (`ModuleNotFoundError:
 No module named 'torchvision'` otherwise), even though nothing in this repo calls it directly.
 (`bin/`, not `Scripts/` -- this machine is Linux. `Scripts/` in older notes here was
@@ -196,6 +209,25 @@ inside the spawned child. Verified: `import manager_agent` + a GPU matmul no lon
 crashes, and a full `StardistWorker.init()`/`.run()` round trip (real model load,
 inference, outline PNG) works with GPU matmuls succeeding both before and after.
 
+**CellViT's inference path (`cell_segmentation/inference/cell_detection.py`, via
+`models/segmentation/cell_segmentation/cellvit.py`'s `calculate_instance_map`) transitively
+imports `numba`** (`cell_segmentation/utils/tools.py`, `from numba import njit, prange`) --
+numba bundles its own LLVM via `llvmlite`, the same category of dependency that forces
+StarDist's TensorFlow into a subprocess above. This looked like it might hit the identical
+"CommandLine Error: Option ... registered more than once!" crash when loaded in the same
+process as the manager's own Qwen/ROCm-torch. **Empirically verified (2026-07-22) that it does
+NOT crash here**: loaded Qwen (one real `.ask()` call), then imported
+`cell_segmentation.inference.cell_detection.CellSegmentationInference`, loaded CellViT-SAM-H,
+ran one real forward pass, then ran a second real Qwen `.ask()` call -- all in one process, no
+crash. (The `@njit`-decorated functions in `tools.py` are only called by CellViT's own
+training/experiment scripts, never by `cell_detection.py`'s inference path -- merely importing
+numba, without ever triggering its JIT codegen, doesn't collide with ROCm/Triton's LLVM the way
+TensorFlow's XLA does.) VRAM checked too: ~20.4GB allocated / ~22.9GB reserved with both models
+resident and generating, ~45GB+ still free (`torch.cuda.mem_get_info()`) -- comfortable
+headroom on this machine. Net effect: CellViT runs in-process in `manager_agent.py`
+(`CellvitClient`, no `StardistWorker`-style subprocess needed) -- unlike StarDist, which must
+stay isolated.
+
 ## Design notes (see also git history / commit messages)
 
 - `manager_agent.py` uses Qwen3-VL-8B-Instruct (local, via `transformers`) instead
@@ -215,9 +247,31 @@ inference, outline PNG) works with GPU matmuls succeeding both before and after.
   `internal_would_accept`), to compare the new dialogue-driven judgments against the
   old hard-threshold ones after the fact -- it's never in the manager's own prompts.
   Falls back to Qwen's own 0-10 visual scoring (no expert, no dialogue) when no
-  ground truth is supplied for the routed agent. `agentic_countgd.py`/
-  `agentic_stardist.py` themselves are untouched -- the manager only imports their
-  existing functions.
+  ground truth is supplied for the routed agent. `agentic_countgd.py` is untouched;
+  `agentic_stardist.py` only gained small additive per-class PanNuke ground-truth
+  functions (`pannuke_class_counts`/`pannuke_class_instance_labels`/
+  `load_pannuke_samples_with_classes`/`load_pannuke_sample_with_classes`, for CellViT
+  below) -- the manager otherwise only imports existing functions from both.
+- CellViT (`agentic_cellvit.py`) is a third routable agent (2026-07-22), alongside
+  CountGD/StarDist, with the same ExpertReasoner/dialogue/escalation shape:
+  `EXPERT_PERSONA_CELLVIT`/`build_cellvit_dossier`/`decide_cellvit_from_dialogue`/
+  `run_cellvit_with_feedback`. Unlike CountGD (counts) and StarDist (segments, no
+  typing), CellViT *classifies* nuclei into 5 fixed PanNuke types (Neoplastic,
+  Inflammatory, Connective, Dead, Epithelial) -- `select_agent`'s routing prompt
+  sends "how many/which are X-type cells" tasks to CellViT and generic "count/
+  segment the nuclei" tasks to StarDist. Its internal (logged-only, never
+  decision-driving) ground-truth metric is per-class mPQ + F1 -- the official
+  PanNuke/CellViT paper protocol, not a naive count comparison -- computed by
+  rasterizing CellViT's predicted contours into per-class instance-label arrays and
+  reusing `compute_panoptic_quality` once per class via a new
+  `StardistWorker.score_cellvit_predictions` method (needs the StarDist subprocess
+  even though CellViT itself runs in-process, since `compute_panoptic_quality` lives
+  in `agentic_stardist.py`). One real architectural limitation, unlike StarDist's
+  prob_thresh/nms_thresh: CellViT's revision levers (`target_classes`/
+  `prob_threshold`) can only fix recall/scope issues, never outright
+  misclassification -- there's no tunable knob for "the model called an Epithelial
+  cell Neoplastic," and `decide_cellvit_from_dialogue`'s prompt says so explicitly
+  so the manager doesn't hallucinate a fix that doesn't exist.
 - No API key is required to run `manager_agent.py` -- Qwen runs locally, CountGD is
   a public hosted Gradio Space. The `anthropic` package is still a required import
   (transitively, via `agentic_countgd.py`/`agentic_stardist.py`) but is never called.

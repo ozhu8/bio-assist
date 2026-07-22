@@ -14,7 +14,6 @@ Usage:
 """
 import argparse
 import contextlib
-import io
 import json
 import random
 import zipfile
@@ -35,9 +34,18 @@ TISSUE_DIVERSITY_MAX_INDEX = 1500
 
 @contextlib.contextmanager
 def _open_pannuke_zip(fold: int, block_size: int | None = None):
+    """Passes the fsspec HTTP file handle straight to zipfile.ZipFile instead of calling
+    fp.read() to materialize it into an in-memory buffer first -- zipfile only seeks/reads
+    the central directory plus whatever members are actually opened, so this never downloads
+    the full ~700MB+ zip. Calling fp.read() unconditionally instead pulls the entire remote
+    zip into memory with no retry around it -- that unbounded whole-file read (not the
+    per-block HTTP chunk size) is what produces FSTimeoutError, since one dropped connection
+    anywhere across a many-hundred-MB transfer aborts the whole thing (see agentic_stardist.py's
+    equivalent function, which hit and fixed the same bug this duplicates the fetch logic from).
+    Context manager so the underlying fsspec HTTP handle (which ZipFile.close() does not close,
+    since it didn't open the path itself) always gets closed too."""
     with fsspec.open(PANNUKE_FOLD_URL.format(fold=fold), mode="rb", block_size=block_size) as fp:  # type: ignore[assignment]
-        data = fp.read()  # type: ignore[attr-defined]
-        zf = zipfile.ZipFile(io.BytesIO(data))
+        zf = zipfile.ZipFile(fp)  # type: ignore[arg-type]
         try:
             yield zf
         finally:
@@ -81,7 +89,7 @@ def _read_array_prefix(zf: zipfile.ZipFile, member: str, n: int, retries: int = 
 
 
 def load_pannuke_types(fold: int) -> list:
-    with _open_pannuke_zip(fold) as zf:
+    with _open_pannuke_zip(fold, block_size=PANNUKE_HTTP_BLOCK_SIZE) as zf:
         with zf.open(f"Fold {fold}/images/fold{fold}/types.npy") as tf:
             _, _, dtype = _read_npy_header(tf)
             types = np.frombuffer(tf.read(), dtype=dtype)

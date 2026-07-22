@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run 5 PanNuke images (spread across tissue types) through agentic_cellvit.py and
-# merge the per-image PDF reports into one cellvit_results1.pdf.
+# merge the per-image PDF reports into one cell_vit_results1.pdf.
 #
 # Intended to run on a machine with a working CUDA (or ROCm, which exposes the same
 # torch.cuda API) GPU -- CellViT's own CellSegmentationInference hardcodes
@@ -16,8 +16,9 @@
 # Usage (from the bio-assist repo root):
 #   ./run_cellvit_pannuke_batch.sh
 #
-# Assumes ANTHROPIC_API_KEY is set (or `ant auth login` has been run) -- agentic_cellvit.py
-# needs it for the Claude orchestration/evaluation calls.
+# No ANTHROPIC_API_KEY needed -- agentic_cellvit.py's orchestration/evaluation now runs
+# on a local Qwen3-VL-8B-Instruct model (transformers), same approach as manager_agent.py,
+# not the Claude API.
 
 set -euo pipefail
 
@@ -35,7 +36,7 @@ CHECKPOINT_DRIVE_ID="1MvRKNzDW2eHbQb5rAgTEp6s2zAXHixRV"
 
 SAMPLES_DIR="$REPO_ROOT/pannuke_cellvit_samples"
 BATCH_OUTPUT_DIR="$REPO_ROOT/cellvit_pannuke_batch_output"
-FINAL_PDF="$REPO_ROOT/cellvit_results1.pdf"
+FINAL_PDF="$REPO_ROOT/cell_vit_results1.pdf"
 PROMPT="${CELLVIT_PROMPT:-Count and classify every nucleus in this tissue sample, broken down by cell type.}"
 
 echo "=== 1. CellViT repo ==="
@@ -54,7 +55,7 @@ PIP="$VENV_DIR/bin/pip"
 
 echo "=== 3. Install dependencies ==="
 "$PIP" install --upgrade pip
-"$PIP" install anthropic matplotlib pillow numpy fsspec pypdf gdown
+"$PIP" install matplotlib pillow numpy fsspec aiohttp pypdf gdown transformers accelerate qwen-vl-utils
 # CellViT's own requirements.txt (needed by cell_segmentation/inference/cell_detection.py's
 # imports and the model-building code it pulls in). If this fails on an old pinned version
 # under your default python3, retry the venv creation with an older interpreter (the repo's
@@ -63,6 +64,8 @@ echo "=== 3. Install dependencies ==="
   echo "!! requirements.txt install had failures -- see CLAUDE.md note about old pins; you may need an older python3.x for the venv."
 # Install torch LAST and separately, from AMD's gfx1151-specific ROCm nightly index --
 # matches the working recipe already verified for .venv-manager in this repo's CLAUDE.md.
+# (transformers/qwen-vl-utils above pull in torchvision-independent deps only; torchvision
+# itself still needs to come from this same ROCm index, same reasoning as .venv-manager.)
 "$PIP" install --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ torch torchvision
 
 echo "=== 4. Verify GPU is visible to torch ==="
@@ -77,7 +80,7 @@ EOF
 echo "=== 5. Download CellViT-SAM-H-x40 checkpoint ==="
 mkdir -p "$CHECKPOINT_DIR"
 if [ ! -f "$CHECKPOINT_PATH" ]; then
-  "$VENV_DIR/bin/gdown" --id "$CHECKPOINT_DRIVE_ID" -O "$CHECKPOINT_PATH"
+  "$VENV_DIR/bin/gdown" "$CHECKPOINT_DRIVE_ID" -O "$CHECKPOINT_PATH"
   # Google Drive sometimes serves an HTML "can't scan for viruses" interstitial instead of
   # the file for large downloads. If gdown fails or CHECKPOINT_PATH looks tiny (a few KB),
   # download it manually in a browser from:

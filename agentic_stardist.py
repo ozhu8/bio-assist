@@ -291,6 +291,62 @@ def load_pannuke_sample(fold: int, index: int):
     return images[-1], gt_labels_list[-1], tissue_labels[-1]
 
 
+# Class names duplicated here as a literal, not imported from agentic_cellvit.NUCLEI_CLASSES --
+# importing agentic_cellvit would pull torch into this process, which only has TensorFlow
+# loaded (see manager_agent.py's StardistWorker docstring for why torch and TensorFlow/ROCm
+# can't coexist here).
+PANNUKE_CLASS_NAMES = ["Neoplastic", "Inflammatory", "Connective", "Dead", "Epithelial"]
+
+
+def pannuke_class_counts(mask: np.ndarray) -> dict:
+    """Per-class true instance counts from one raw PanNuke mask -- unlike
+    pannuke_mask_to_instance_labels, which unions all 5 class channels into one class-agnostic
+    instance mask for StarDist's own PQ scoring, this keeps each class's count separate, for
+    CellViT's per-class ground truth."""
+    counts = {}
+    for c, name in enumerate(PANNUKE_CLASS_NAMES):
+        channel = mask[..., c]
+        counts[name] = int(len(np.unique(channel)) - (1 if 0 in channel else 0))
+    return counts
+
+
+def pannuke_class_instance_labels(mask: np.ndarray) -> dict:
+    """Per-class raw instance-label arrays from one raw PanNuke mask -- each of mask's first 5
+    channels is already, individually, in compute_panoptic_quality's expected standard
+    label-mask format (2D int array, background=0, unique positive instance IDs), so this is
+    just a per-class split with no extra work, for scoring CellViT's per-class predictions."""
+    return {name: mask[..., c] for c, name in enumerate(PANNUKE_CLASS_NAMES)}
+
+
+def load_pannuke_samples_with_classes(fold: int, n: int):
+    """Sibling to load_pannuke_samples, additionally returning per-image per-class ground
+    truth (pannuke_class_counts, pannuke_class_instance_labels) for CellViT -- a new function
+    rather than changing load_pannuke_samples's return shape, since existing callers already
+    unpack its fixed 3-tuple."""
+    with _open_pannuke_zip(fold) as zf:
+        with zf.open(f"Fold {fold}/images/fold{fold}/types.npy") as tf:
+            _, _, dtype = _read_npy_header(tf)
+            types = np.frombuffer(tf.read(n * dtype.itemsize), dtype=dtype)[:n]
+
+        raw, shape, dtype = _read_array_prefix(zf, f"Fold {fold}/images/fold{fold}/images.npy", n)
+        images = np.frombuffer(raw, dtype=dtype).reshape((n,) + shape[1:]).astype(np.uint8)
+
+        raw, shape, dtype = _read_array_prefix(zf, f"Fold {fold}/masks/fold{fold}/masks.npy", n)
+        masks = np.frombuffer(raw, dtype=dtype).reshape((n,) + shape[1:])
+
+    class_counts_list = [pannuke_class_counts(masks[i]) for i in range(n)]
+    class_labels_list = [pannuke_class_instance_labels(masks[i]) for i in range(n)]
+    return images, class_counts_list, class_labels_list, [str(t) for t in types]
+
+
+def load_pannuke_sample_with_classes(fold: int, index: int):
+    """Fetch a single image + per-class ground truth (+ tissue label) at `index` --
+    single-sample counterpart to load_pannuke_samples_with_classes, mirroring
+    load_pannuke_sample's relationship to load_pannuke_samples."""
+    images, class_counts_list, class_labels_list, tissue_labels = load_pannuke_samples_with_classes(fold, index + 1)
+    return images[-1], class_counts_list[-1], class_labels_list[-1], tissue_labels[-1]
+
+
 def run_stardist(
     model: StarDist2D, image: np.ndarray, prob_thresh: Optional[float] = None, nms_thresh: Optional[float] = None
 ) -> Tuple[np.ndarray, dict]:

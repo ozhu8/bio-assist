@@ -1,14 +1,21 @@
 """
-Agentic cell-classification pipeline: Claude orchestrates CellViT.
+Agentic cell-classification pipeline: a local Qwen3-VL manager orchestrates CellViT.
 
 Unlike CountGD (a hosted Gradio Space taking a free-text object name), CellViT
 (https://github.com/TIO-IKIM/CellViT) is a local, checkpoint-based nucleus
 segmentation/classification model with a fixed five-class taxonomy (PanNuke:
 Neoplastic, Inflammatory, Connective, Dead, Epithelial). So instead of turning
-the user's request into free text, Claude maps it onto a subset of those five
+the user's request into free text, Qwen maps it onto a subset of those five
 classes plus a confidence threshold, CellViT segments and classifies every
-nucleus in the image, and Claude evaluates the annotated result and retries
+nucleus in the image, and Qwen evaluates the annotated result and retries
 with an adjusted class selection/threshold if it looks wrong.
+
+Qwen runs locally (transformers, same model/loading approach as
+manager_agent.py's QwenVLM) rather than calling the Claude API -- no
+ANTHROPIC_API_KEY is needed to run this script. There's no ground-truth expert
+persona here (unlike manager_agent.py's CountGD/StarDist routing): PanNuke
+supplies images but no per-nucleus-type ground truth to hand to one, so Qwen
+always falls back to scoring its own result visually, 0-10.
 
 CellViT's documented workflow (`cell_segmentation/inference/cell_detection.py`)
 expects a whole-slide image already tiled into 1024x1024 patches with 64px
@@ -28,26 +35,81 @@ Usage:
         --cellvit-repo /path/to/CellViT
 """
 import argparse
-import base64
 import json
-import mimetypes
 import sys
 import textwrap
 from pathlib import Path
 from typing import Optional
 
-import anthropic # pyright: ignore[reportMissingImports]
-from anthropic.types import ImageBlockParam, TextBlockParam, Base64ImageSourceParam # pyright: ignore[reportMissingImports]
 import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
 import numpy as np # pyright: ignore[reportMissingImports]
 import torch # pyright: ignore[reportMissingImports]
 from matplotlib.backends.backend_pdf import PdfPages # pyright: ignore[reportMissingModuleSource]
 from PIL import Image, ImageDraw # pyright: ignore[reportMissingImports]
 
-MODEL = "claude-opus-4-8"
+MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 PDF_NAME = "cellvit_results.pdf"
 PATCH_SIZE = 1024  # CellViT's required patch size (see cell_detection.py header comment)
 NUCLEI_CLASSES = ["Neoplastic", "Inflammatory", "Connective", "Dead", "Epithelial"]
+
+
+class QwenVLM:
+    """Lazily loads Qwen3-VL and answers single image+text prompts with it.
+
+    Same class as manager_agent.py's QwenVLM (trimmed to the ask/ask_json
+    methods this script actually needs) -- duplicated rather than imported so
+    this script stays standalone/self-contained like agentic_countgd.py and
+    agentic_stardist.py, each with their own venv (see CLAUDE.md)."""
+
+    def __init__(self, model_id: str = MODEL_ID, device_map: str = "auto"):
+        self.model_id = model_id
+        self.device_map = device_map
+        self._model = None
+        self._processor = None
+
+    def _load(self):
+        if self._model is None:
+            from transformers import AutoModelForImageTextToText, AutoProcessor # pyright: ignore[reportMissingImports]
+            self._model = AutoModelForImageTextToText.from_pretrained(
+                self.model_id, dtype="auto", device_map=self.device_map
+            )
+            self._processor = AutoProcessor.from_pretrained(self.model_id)
+        return self._model, self._processor
+
+    def ask(self, image_path: str, prompt: str, max_new_tokens: int = 512) -> str:
+        from qwen_vl_utils import process_vision_info # pyright: ignore[reportMissingImports]
+        model, processor = self._load()
+        assert processor is not None, "Processor failed to load"
+
+        messages = [{
+            "role": "user",
+            "content": [{"type": "image", "image": image_path}, {"type": "text", "text": prompt}],
+        }]
+        chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = processor(
+            text=[chat_text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
+        ).to(model.device)
+
+        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
+        return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
+
+    def ask_json(self, image_path: str, prompt: str, max_new_tokens: int = 512, required_keys: Optional[list] = None) -> dict:
+        """Unlike the Claude calls this replaces, Qwen has no API-enforced JSON schema, so its
+        free-text output can drop a requested key. Callers that will subscript the result (e.g.
+        result["score"]) should pass required_keys so a malformed response fails here with a
+        clear message instead of a bare KeyError deep in the caller."""
+        raw = self.ask(image_path, prompt, max_new_tokens=max_new_tokens)
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end == -1:
+            raise ValueError(f"Qwen response did not contain a JSON object: {raw!r}")
+        result = json.loads(raw[start:end + 1])
+        if required_keys:
+            missing = [k for k in required_keys if k not in result]
+            if missing:
+                raise ValueError(f"Qwen JSON response is missing required key(s) {missing}: {result!r}")
+        return result
 
 
 def load_cellvit_module(cellvit_repo: str):
@@ -65,20 +127,6 @@ def load_cellvit_module(cellvit_repo: str):
             "--cellvit-repo /path/to/CellViT (or put it on PYTHONPATH)."
         ) from exc
     return CellSegmentationInference, COLOR_DICT
-
-
-def image_to_content_block(image_path: str) -> ImageBlockParam:
-    mime_type, _ = mimetypes.guess_type(image_path)
-    # Map detected MIME type to one of the allowed literal values; default to image/png
-    allowed_types = ["image/jpeg", "image/png", "image/gif", "image/webp"]
-    if mime_type not in allowed_types:
-        mime_type = "image/png"
-    data = base64.standard_b64encode(Path(image_path).read_bytes()).decode("utf-8")
-    source = Base64ImageSourceParam(type="base64", media_type=mime_type, data=data)  # type: ignore[arg-type]
-    return ImageBlockParam(
-        type="image",
-        source=source,
-    )
 
 
 def load_patch(image_path: str) -> Image.Image:
@@ -105,7 +153,12 @@ def autocast_device_type(inferer) -> str:
 
 
 def run_cellvit(inferer, image_path: str, magnification: float, target_classes: set, prob_threshold: float, color_dict: dict):
-    """Run one CellViT forward pass, treating the whole image as a single 1024x1024 patch."""
+    """Run one CellViT forward pass, treating the whole image as a single 1024x1024 patch.
+    Returns (annotated, matched, counts_by_type, cells) -- matched/counts_by_type are filtered
+    by target_classes/prob_threshold (what the user asked for), while cells is every detected
+    nucleus regardless of that filter (contour in load_patch's 1024x1024 letterboxed-patch
+    coordinate space, type_name, type_prob) -- needed by callers that score the underlying
+    per-class classification quality against ground truth, independent of what was requested."""
     image = load_patch(image_path)
     patch = inferer.inference_transforms(image).unsqueeze(0).to(inferer.device)
 
@@ -139,7 +192,7 @@ def run_cellvit(inferer, image_path: str, magnification: float, target_classes: 
         counts_by_type[c["type_name"]] = counts_by_type.get(c["type_name"], 0) + 1
 
     annotated = draw_annotations(image, cells, matched, color_dict)
-    return annotated, matched, counts_by_type
+    return annotated, matched, counts_by_type, cells
 
 
 def draw_annotations(image: Image.Image, all_cells: list, matched_cells: list, color_dict: dict) -> Image.Image:
@@ -198,53 +251,30 @@ def run_raw_inference(inferer, image_path: str, magnification: float):
     return instance_map, nuclei
 
 
-def interpret_request(claude: anthropic.Anthropic, user_prompt: str, image_path: str) -> dict:
-    response = claude.messages.create(
-        model=MODEL,
-        max_tokens=1024,
-        thinking={"type": "adaptive"},
-        output_config={
-            "format": {
-                "type": "json_schema",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "target_classes": {
-                            "type": "array",
-                            "items": {"type": "string", "enum": NUCLEI_CLASSES},
-                            "minItems": 1,
-                        },
-                        "prob_threshold": {"type": "number"},
-                    },
-                    "required": ["target_classes", "prob_threshold"],
-                    "additionalProperties": False,
-                },
-            }
-        },
-        messages=[{
-            "role": "user",
-            "content": [
-                image_to_content_block(image_path),
-                TextBlockParam(type="text", text=(
-                    "CellViT classifies nuclei in histopathology images into exactly five "
-                    f"fixed classes: {', '.join(NUCLEI_CLASSES)}. The user wants: "
-                    f"\"{user_prompt}\"\n\n"
-                    "Map their request onto one or more of these five class names (pick every "
-                    "class that plausibly matches what they're asking about; if they clearly "
-                    "want everything counted, include all five). Also pick a type_prob "
-                    "confidence threshold in [0, 1] for keeping a detection - 0.5 is a "
-                    "reasonable default, raise it if the request implies only confident/obvious "
-                    "cells and lower it if it implies catching everything."
-                )),
-            ],
-        }],
+def interpret_request(qwen: QwenVLM, user_prompt: str, image_path: str) -> dict:
+    prompt = (
+        "CellViT classifies nuclei in histopathology images into exactly five "
+        f"fixed classes: {', '.join(NUCLEI_CLASSES)}. The user wants: "
+        f"\"{user_prompt}\"\n\n"
+        "Map their request onto one or more of these five class names (pick every "
+        "class that plausibly matches what they're asking about; if they clearly "
+        "want everything counted, include all five). Also pick a type_prob "
+        "confidence threshold in [0, 1] for keeping a detection - 0.5 is a "
+        "reasonable default, raise it if the request implies only confident/obvious "
+        "cells and lower it if it implies catching everything.\n\n"
+        "Reply with ONLY a JSON object matching this schema: "
+        f"{{\"target_classes\": [one or more of {json.dumps(NUCLEI_CLASSES)}], "
+        "\"prob_threshold\": number}}"
     )
-    text = next(b.text for b in response.content if b.type == "text")
-    return json.loads(text)
+    result = qwen.ask_json(image_path, prompt, required_keys=["target_classes", "prob_threshold"])
+    invalid = [c for c in result["target_classes"] if c not in NUCLEI_CLASSES]
+    if invalid or not result["target_classes"]:
+        raise ValueError(f"Qwen returned invalid target_classes: {result!r}")
+    return result
 
 
 def evaluate_result(
-    claude: anthropic.Anthropic,
+    qwen: QwenVLM,
     user_prompt: str,
     target_classes: list,
     prob_threshold: float,
@@ -253,64 +283,31 @@ def evaluate_result(
     annotated_image_path: str,
     history: list,
 ) -> dict:
-    response = claude.messages.create(
-        model=MODEL,
-        max_tokens=4096,
-        thinking={"type": "adaptive"},
-        output_config={
-            "format": {
-                "type": "json_schema",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "accept": {"type": "boolean"},
-                        "score": {"type": "integer"},
-                        "feedback": {"type": "string"},
-                        "revised_target_classes": {
-                            "anyOf": [
-                                {
-                                    "type": "array",
-                                    "items": {"type": "string", "enum": NUCLEI_CLASSES},
-                                },
-                                {"type": "null"},
-                            ],
-                        },
-                        "revised_prob_threshold": {
-                            "anyOf": [{"type": "number"}, {"type": "null"}],
-                        },
-                    },
-                    "required": ["accept", "score", "feedback", "revised_target_classes", "revised_prob_threshold"],
-                    "additionalProperties": False,
-                },
-            }
-        },
-        messages=[{
-            "role": "user",
-            "content": [
-                image_to_content_block(annotated_image_path),
-                TextBlockParam(type="text", text=(
-                    f"Original user request: \"{user_prompt}\"\n"
-                    f"CellViT was asked to highlight: {target_classes} (type_prob >= {prob_threshold})\n"
-                    f"Matched cell count: {predicted_count}\n"
-                    f"All detected cells by type: {json.dumps(counts_by_type)}\n"
-                    f"Prior attempts this session: {json.dumps(history)}\n\n"
-                    "The attached image shows every nucleus CellViT detected as a colored "
-                    "outline (thick outline = matches the target class(es) and threshold, thin "
-                    "outline = detected but excluded). Evaluate: (1) do the thick outlines look "
-                    "visually accurate for the requested class(es) (no obvious misclassifications, "
-                    "missed nuclei, or false positives)? (2) is the matched count histologically "
-                    "plausible for what's shown? (3) does this satisfy the user's original "
-                    "request?\n"
-                    "Score 0-10. If score < 7 and a different class selection or threshold would "
-                    "plausibly fix it, set accept=false and give revised_target_classes and/or "
-                    "revised_prob_threshold to retry with. Otherwise set accept=true and leave "
-                    "both revised fields null."
-                )),
-            ],
-        }],
+    prompt = (
+        f"Original user request: \"{user_prompt}\"\n"
+        f"CellViT was asked to highlight: {target_classes} (type_prob >= {prob_threshold})\n"
+        f"Matched cell count: {predicted_count}\n"
+        f"All detected cells by type: {json.dumps(counts_by_type)}\n"
+        f"Prior attempts this session: {json.dumps(history, default=str)}\n\n"
+        "The attached image shows every nucleus CellViT detected as a colored "
+        "outline (thick outline = matches the target class(es) and threshold, thin "
+        "outline = detected but excluded). Evaluate: (1) do the thick outlines look "
+        "visually accurate for the requested class(es) (no obvious misclassifications, "
+        "missed nuclei, or false positives)? (2) is the matched count histologically "
+        "plausible for what's shown? (3) does this satisfy the user's original "
+        "request?\n"
+        "Score 0-10. If score < 7 and a different class selection or threshold would "
+        "plausibly fix it, set accept=false and give revised_target_classes and/or "
+        "revised_prob_threshold to retry with. Otherwise set accept=true and leave "
+        "both revised fields null.\n\n"
+        "Reply with ONLY a JSON object matching this schema: {\"accept\": bool, "
+        "\"score\": int, \"feedback\": str (1-2 sentences), "
+        "\"revised_target_classes\": array or null, \"revised_prob_threshold\": number or null}"
     )
-    text = next(b.text for b in response.content if b.type == "text")
-    return json.loads(text)
+    return qwen.ask_json(
+        annotated_image_path, prompt, max_new_tokens=768,
+        required_keys=["accept", "score", "feedback"],
+    )
 
 
 ACCEPT_SCORE_THRESHOLD = 7
@@ -409,12 +406,12 @@ def save_pdf_report(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run CellViT with Claude as orchestrator/evaluator")
+    parser = argparse.ArgumentParser(description="Run CellViT with a local Qwen3-VL manager as orchestrator/evaluator")
     parser.add_argument("--image", required=True, help="Path to the input image (treated as one patch)")
     parser.add_argument("--prompt", default=None, help="What to count / user instruction (ignored with --raw-only)")
     parser.add_argument(
         "--raw-only", action="store_true",
-        help="Skip the Claude agent loop; run a single CellViT forward pass and dump raw output "
+        help="Skip the Qwen agent loop; run a single CellViT forward pass and dump raw output "
              "(instance mask + per-nucleus type predictions) with no evaluation/retries",
     )
     parser.add_argument("--checkpoint", required=True, help="Path to a CellViT model checkpoint (.pth)")
@@ -425,6 +422,7 @@ def main():
     parser.add_argument("--max-iterations", type=int, default=3)
     parser.add_argument("--output-dir", default="./cellvit_agent_output")
     parser.add_argument("--pdf-name", default=PDF_NAME, help="Filename for the saved PDF report")
+    parser.add_argument("--model-id", default=MODEL_ID, help="Hugging Face repo id for the Qwen manager")
     args = parser.parse_args()
     if args.max_iterations < 1:
         parser.error("--max-iterations must be at least 1")
@@ -459,11 +457,11 @@ def main():
         print(f"Saved raw per-nucleus labels (.json, {len(nuclei)} records): {nuclei_path}")
         return
 
-    claude = anthropic.Anthropic()
-    request = interpret_request(claude, args.prompt, args.image)
+    qwen = QwenVLM(args.model_id)
+    request = interpret_request(qwen, args.prompt, args.image)
     target_classes = set(request["target_classes"])
     prob_threshold = request["prob_threshold"]
-    print(f"[Claude] target classes: {sorted(target_classes)}, prob_threshold={prob_threshold:.2f}")
+    print(f"[Qwen] target classes: {sorted(target_classes)}, prob_threshold={prob_threshold:.2f}")
 
     history = []
     saved_paths = []
@@ -472,7 +470,7 @@ def main():
     counts_by_type = {}
     for i in range(1, args.max_iterations + 1):
         print(f"\n--- Iteration {i}: CellViT highlighting {sorted(target_classes)} (p>={prob_threshold:.2f}) ---")
-        annotated_image, matched_cells, counts_by_type = run_cellvit(
+        annotated_image, matched_cells, counts_by_type, _cells = run_cellvit(
             inferer, args.image, args.magnification, target_classes, prob_threshold, COLOR_DICT
         )
         predicted_count = len(matched_cells)
@@ -483,11 +481,11 @@ def main():
         saved_paths.append(saved_path)
 
         eval_result = evaluate_result(
-            claude, args.prompt, sorted(target_classes), prob_threshold,
+            qwen, args.prompt, sorted(target_classes), prob_threshold,
             predicted_count, counts_by_type, str(saved_path), history,
         )
-        print(f"[Claude eval] score={eval_result['score']} accept={eval_result['accept']}")
-        print(f"[Claude eval] feedback: {eval_result['feedback']}")
+        print(f"[Qwen eval] score={eval_result['score']} accept={eval_result['accept']}")
+        print(f"[Qwen eval] feedback: {eval_result['feedback']}")
 
         history.append({
             "iteration": i,
