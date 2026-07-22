@@ -28,7 +28,7 @@ Usage:
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Dict
 
 import numpy as np  # pyright: ignore[reportMissingImports]
 
