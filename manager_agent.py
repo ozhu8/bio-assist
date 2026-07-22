@@ -1927,7 +1927,7 @@ def main():
         import pyvips  # pyright: ignore[reportMissingImports]
         slide_path = args.slide
         image_path = str(output_dir / "slide_routing_preview.png")
-        pyvips.Image.thumbnail(slide_path, 512).write_to_file(image_path)
+        pyvips.Image.thumbnail(slide_path, 512).write_to_file(image_path)  # type: ignore[attr-defined] -- pyvips generates methods dynamically via __getattr__, no stubs
         print(f"Generated routing preview {image_path} from {slide_path}")
     elif args.pannuke_index is not None:
         print(f"Fetching PanNuke fold {args.pannuke_fold} image {args.pannuke_index}...")
