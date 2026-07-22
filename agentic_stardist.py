@@ -79,9 +79,12 @@ PANNUKE_FOLD_URL = "https://warwick.ac.uk/fac/cross_fac/tia/data/pannuke/fold_{f
 TISSUE_DIVERSITY_MAX_INDEX = 1500
 
 
+ALLOWED_IMAGE_MIME_TYPES = ("image/jpeg", "image/png", "image/gif", "image/webp")
+
+
 def image_to_content_block(image_path: str):
     mime_type, _ = mimetypes.guess_type(image_path)
-    if mime_type is None:
+    if mime_type not in ALLOWED_IMAGE_MIME_TYPES:
         mime_type = "image/png"
     data = base64.standard_b64encode(Path(image_path).read_bytes()).decode("utf-8")
     return {
@@ -868,6 +871,8 @@ def main():
         parser.error("--max-iterations must be at least 1")
     if not args.image and args.pannuke_n is None and args.pannuke_index is None and args.pannuke_loop_n is None:
         parser.error("one of --image, --pannuke-n, --pannuke-index, or --pannuke-loop-n is required")
+    if args.pannuke_loop_n is not None and args.pannuke_loop_n < 1:
+        parser.error("--pannuke-loop-n must be at least 1")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

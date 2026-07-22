@@ -28,9 +28,12 @@ COUNTGD_SPACE = "nikigoli/countgd"
 PDF_NAME = "countgd_results.pdf"
 
 
+ALLOWED_IMAGE_MIME_TYPES = ("image/jpeg", "image/png", "image/gif", "image/webp")
+
+
 def image_to_content_block(image_path: str) -> ImageBlockParam:
     mime_type, _ = mimetypes.guess_type(image_path)
-    if mime_type is None:
+    if mime_type not in ALLOWED_IMAGE_MIME_TYPES:
         mime_type = "image/png"
     data = base64.standard_b64encode(Path(image_path).read_bytes()).decode("utf-8")
     return cast(ImageBlockParam, {

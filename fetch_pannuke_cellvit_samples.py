@@ -136,6 +136,8 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-dir", default="pannuke_cellvit_samples")
     args = parser.parse_args()
+    if args.n < 1:
+        parser.error("--n must be at least 1")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
