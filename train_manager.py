@@ -89,32 +89,35 @@ def build_note(qwen, agent: str, image_id: str, history: list, final_image_path,
 
 
 def run_countgd_trial(manager: ManagerAgent, image_path: str, image_id: str, ground_truth_count: int,
-                       max_iterations: int, output_dir: Path) -> dict:
+                       max_iterations: int, output_dir: Path, expert_notes: str = "") -> dict:
     result = run_countgd_with_feedback(
         manager.qwen, manager.countgd_client, image_path, "count the individual cells",
         max_iterations, output_dir, ground_truth_count=ground_truth_count, image_id=image_id,
+        expert_notes=expert_notes,
     )
     return build_note(manager.qwen, "countgd", image_id, result["history"], result["annotated_image"],
                        lower_is_better=True, chosen_iteration=result["chosen_iteration"])
 
 
 def run_stardist_trial(manager: ManagerAgent, image_path: str, image_id: str, ground_truth_labels,
-                        max_iterations: int, output_dir: Path) -> dict:
+                        max_iterations: int, output_dir: Path, expert_notes: str = "") -> dict:
     result = run_stardist_with_feedback(
         manager.qwen, manager.stardist_worker, image_path, "segment the individual nuclei",
         max_iterations, output_dir, ground_truth_labels=ground_truth_labels, image_id=image_id,
+        expert_notes=expert_notes,
     )
     return build_note(manager.qwen, "stardist", image_id, result["history"], result["outlines_image"],
                        lower_is_better=False, chosen_iteration=result["chosen_iteration"])
 
 
 def run_cellvit_trial(manager: ManagerAgent, image_path: str, image_id: str, ground_truth_counts_by_type: dict,
-                       ground_truth_class_labels: dict, max_iterations: int, output_dir: Path) -> dict:
+                       ground_truth_class_labels: dict, max_iterations: int, output_dir: Path,
+                       expert_notes: str = "") -> dict:
     result = run_cellvit_with_feedback(
         manager.qwen, manager.cellvit_client, image_path, "classify the individual nuclei by cell type",
         max_iterations, output_dir, ground_truth_counts_by_type=ground_truth_counts_by_type,
         ground_truth_class_labels=ground_truth_class_labels, stardist_worker=manager.stardist_worker,
-        image_id=image_id,
+        image_id=image_id, expert_notes=expert_notes,
     )
     return build_note(manager.qwen, "cellvit", image_id, result["history"], result["annotated_image"],
                        lower_is_better=False, chosen_iteration=result["chosen_iteration"])
@@ -203,6 +206,35 @@ def merge_escalation_feedback(qwen, running_prompt: str, image_id: str, expert_s
     return qwen.ask_text(prompt, max_new_tokens=800).strip()
 
 
+def merge_expert_notes(qwen, expert_notes: str, image_id: str, expert_summary: str) -> str:
+    """Expert-side counterpart to merge_escalation_feedback: that function updates the
+    *manager*'s running_prompt (checkpoint.json) from a human-resolved escalation;this one
+    updates the *expert*'s own persistent notes (checkpoint.json's expert_notes, folded into
+    every future ExpertReasoner's dossier via manager_agent._apply_expert_notes) from the same
+    conversation, so the domain-expert persona reasons consistently across images too, not just
+    the manager. Same keep-what-still-holds/drop-what's-contradicted framing as
+    merge_escalation_feedback, just aimed at a different reader."""
+    prompt = (
+        "You are refining a running set of private notes that will guide a domain-expert "
+        "persona (you, in a future session, playing a senior specialist who privately holds "
+        "ground truth) on how to reason consistently about specific regions/detections across "
+        "different images of the same kind.\n\n"
+        f"Current notes (may be empty):\n{expert_notes or '(none yet)'}\n\n"
+        f"Image {image_id!r} was escalated to a human reviewer because the automated retry loop "
+        f"never reached an acceptable result on its own. You (the expert) asked the human "
+        f"questions about specific regions, and that conversation was summarized as:\n"
+        f"{expert_summary}\n\n"
+        "Update the notes to fold in this correction -- reinforcing it if it's consistent with "
+        "what's already there, or overriding/qualifying existing guidance if this contradicts "
+        "it. Keep it general/transferable morphological reasoning, not specific to this one "
+        "image -- these notes will be handed to you as private background before you reason "
+        "about entirely different images, so nothing image-specific belongs here.\n"
+        "Reply with ONLY the updated notes as plain text (no JSON, no preamble) -- this text is "
+        "used directly as private background in a future prompt."
+    )
+    return qwen.ask_text(prompt, max_new_tokens=800).strip()
+
+
 def build_countgd_tasks(n: int, output_dir: Path, split: str = "all") -> list:
     tasks = []
     id_prefix = "bbbc005" if split == "all" else f"bbbc005_{split}"
@@ -278,10 +310,11 @@ def interleave_tasks(*task_lists: list) -> list:
     return tasks
 
 
-def save_checkpoint(path: Path, notes: list, running_prompt: str, total_tasks: int) -> None:
+def save_checkpoint(path: Path, notes: list, running_prompt: str, expert_notes: str, total_tasks: int) -> None:
     completed_ids = [n["image_id"] for n in notes]
     path.write_text(json.dumps({
-        "completed_ids": completed_ids, "running_prompt": running_prompt, "notes": notes,
+        "completed_ids": completed_ids, "running_prompt": running_prompt, "expert_notes": expert_notes,
+        "notes": notes,
     }, indent=2, default=str))
     print(f"[checkpoint] {path} ({len(completed_ids)}/{total_tasks} images)")
 
@@ -336,12 +369,14 @@ def main():
 
     notes = []
     running_prompt = ""
+    expert_notes = ""
     if args.resume_from:
         checkpoint = json.loads(Path(args.resume_from).read_text())
         notes = checkpoint["notes"]
         running_prompt = checkpoint["running_prompt"]
+        expert_notes = checkpoint.get("expert_notes", "")  # absent in checkpoints written before this existed
         print(f"Resumed from {args.resume_from}: {len(notes)} images already done, "
-              f"running prompt is {len(running_prompt)} chars.")
+              f"running prompt is {len(running_prompt)} chars, expert notes are {len(expert_notes)} chars.")
 
     completed_ids = {n["image_id"] for n in notes}
     remaining_tasks = [t for t in tasks if t["image_id"] not in completed_ids]
@@ -355,17 +390,17 @@ def main():
         if task["agent"] == "countgd":
             note = run_countgd_trial(
                 manager, task["image_path"], task["image_id"], task["ground_truth_count"],
-                args.max_iterations, output_dir,
+                args.max_iterations, output_dir, expert_notes=expert_notes,
             )
         elif task["agent"] == "cellvit":
             note = run_cellvit_trial(
                 manager, task["image_path"], task["image_id"], task["ground_truth_counts_by_type"],
-                task["ground_truth_class_labels"], args.max_iterations, output_dir,
+                task["ground_truth_class_labels"], args.max_iterations, output_dir, expert_notes=expert_notes,
             )
         else:
             note = run_stardist_trial(
                 manager, task["image_path"], task["image_id"], task["ground_truth_labels"],
-                args.max_iterations, output_dir,
+                args.max_iterations, output_dir, expert_notes=expert_notes,
             )
         notes.append(note)
         new_notes.append(note)
@@ -378,7 +413,7 @@ def main():
             print(f"--- batch stats ---\n{json.dumps(stats, indent=2)}")
             running_prompt = summarize_and_merge(manager.qwen, running_prompt, batch, stats)
             print(f"--- updated training prompt ---\n{running_prompt}\n")
-            save_checkpoint(checkpoint_path, notes, running_prompt, len(tasks))
+            save_checkpoint(checkpoint_path, notes, running_prompt, expert_notes, len(tasks))
 
     out_path = output_dir / "training_result.json"
     out_path.write_text(json.dumps({"final_prompt": running_prompt, "notes": notes}, indent=2, default=str))

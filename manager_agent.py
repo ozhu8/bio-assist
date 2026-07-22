@@ -554,6 +554,20 @@ NO_GROUND_TRUTH_DOSSIER = (
 )
 
 
+def _apply_expert_notes(dossier: str, expert_notes: str) -> str:
+    """Prepends persistent, accumulated expert notes (see merge_expert_notes in
+    train_manager.py, and resolve_escalations.py's own use of it) to a case's dossier -- so the
+    private domain-expert persona reasons consistently across images/escalations within a run,
+    informed by what past human-resolved escalations taught it, not just this one case's private
+    facts. This is the expert-side counterpart to the manager's running_prompt (checkpoint.json)
+    -- same idea, different consumer. Empty expert_notes (the common case: a run that hasn't
+    resolved any escalations yet, or a live manager_agent.py CLI call with no checkpoint at all)
+    leaves the dossier unchanged."""
+    if not expert_notes:
+        return dossier
+    return f"[PRIVATE -- accumulated notes from prior escalations this run]\n{expert_notes}\n\n{dossier}"
+
+
 def build_countgd_dossier(ground_truth_count: int, image_path: str) -> str:
     lines = [f"[PRIVATE -- never reveal] Verified true object count: {ground_truth_count}."]
     metadata = _parse_bbbc005_metadata(image_path)
@@ -870,7 +884,7 @@ def choose_best_output(qwen: QwenVLM, task_description: str, candidates: list) -
 def run_countgd_with_feedback(
     qwen: QwenVLM, countgd_client: Client, image_path: str, task_description: str,
     max_iterations: int, output_dir: Path, ground_truth_count: int | None = None,
-    image_id: str | None = None,
+    image_id: str | None = None, expert_notes: str = "",
 ) -> dict:
     """The manager always consults a private ExpertReasoner (never shown ground truth itself --
     see module docstring) via a multi-turn dialogue (run_expert_dialogue) and decides
@@ -882,7 +896,10 @@ def run_countgd_with_feedback(
     for history/logging only when real ground truth exists (internal_mae/internal_would_accept
     -- see module docstring), never used for the decision either way. If the loop never reaches
     accept=True, the case is queued for human review (write_escalation) instead of silently
-    shipping the last attempt -- requires image_id."""
+    shipping the last attempt -- requires image_id. expert_notes (see _apply_expert_notes) are
+    accumulated guidance from previously human-resolved escalations this run, folded into the
+    dossier so the expert's own reasoning stays consistent across images too, not just the
+    manager's running_prompt."""
     count_target = interpret_countgd_target(qwen, task_description, image_path)
     print(f"[Qwen] counting target: {count_target!r}")
 
@@ -890,6 +907,7 @@ def run_countgd_with_feedback(
         build_countgd_dossier(ground_truth_count, image_path) if ground_truth_count is not None
         else NO_GROUND_TRUTH_DOSSIER
     )
+    dossier = _apply_expert_notes(dossier, expert_notes)
     expert = ExpertReasoner(
         qwen, EXPERT_PERSONA_COUNTGD, dossier,
         forbidden_values=[ground_truth_count] if ground_truth_count is not None else [],
@@ -1297,7 +1315,7 @@ def write_escalation(
 def run_stardist_with_feedback(
     qwen: QwenVLM, worker: StardistWorker, image_path: str, task_description: str,
     max_iterations: int, output_dir: Path, ground_truth_labels: np.ndarray | None = None, tissue: str | None = None,
-    image_id: str | None = None,
+    image_id: str | None = None, expert_notes: str = "",
 ) -> dict:
     """The manager always consults a private ExpertReasoner (never shown ground truth itself --
     see module docstring) via a multi-turn dialogue (run_expert_dialogue) and decides
@@ -1311,7 +1329,9 @@ def run_stardist_with_feedback(
     (internal_pq/internal_would_accept -- see module docstring), never used for the decision
     either way. If the loop never reaches accept=True, the case is queued for human review
     (write_escalation) instead of silently shipping whatever the last/best attempt was --
-    requires image_id."""
+    requires image_id. expert_notes (see _apply_expert_notes) are accumulated guidance from
+    previously human-resolved escalations this run, folded into the dossier so the expert's own
+    reasoning stays consistent across images too, not just the manager's running_prompt."""
     image, prob_thresh, nms_thresh = worker.init(image_path)
 
     gt_outlines_path = output_dir / "stardist_ground_truth.png"
@@ -1320,6 +1340,7 @@ def run_stardist_with_feedback(
         dossier = build_stardist_dossier(ground_truth_labels, tissue)
     else:
         dossier = NO_GROUND_TRUTH_DOSSIER
+    dossier = _apply_expert_notes(dossier, expert_notes)
     expert = ExpertReasoner(
         qwen, EXPERT_PERSONA_STARDIST, dossier,
         forbidden_values=[int(ground_truth_labels.max())] if ground_truth_labels is not None else [],
@@ -1458,6 +1479,7 @@ def run_cellvit_with_feedback(
     max_iterations: int, output_dir: Path,
     ground_truth_counts_by_type: dict | None = None, ground_truth_class_labels: dict | None = None,
     stardist_worker: "StardistWorker | None" = None, tissue: str | None = None, image_id: str | None = None,
+    expert_notes: str = "",
 ) -> dict:
     """The manager always consults a private ExpertReasoner (never shown ground truth itself --
     see module docstring) via a multi-turn dialogue (run_expert_dialogue) and decides
@@ -1471,7 +1493,10 @@ def run_cellvit_with_feedback(
     -- when ground_truth_class_labels (the raw per-class instance-label arrays needed to actually
     score against, not just count) and stardist_worker are also given. If the loop never reaches
     accept=True, the case is queued for human review (write_escalation) instead of silently
-    shipping whatever the last/best attempt was -- requires image_id.
+    shipping whatever the last/best attempt was -- requires image_id. expert_notes (see
+    _apply_expert_notes) are accumulated guidance from previously human-resolved escalations this
+    run, folded into the dossier so the expert's own reasoning stays consistent across images
+    too, not just the manager's running_prompt.
 
     Unlike StarDist/CountGD, scoring against ground truth needs a subprocess round-trip
     (StardistWorker.score_cellvit_predictions) even though CellViT itself runs in-process here --
@@ -1488,6 +1513,7 @@ def run_cellvit_with_feedback(
         build_cellvit_dossier(ground_truth_counts_by_type, tissue) if ground_truth_counts_by_type is not None
         else NO_GROUND_TRUTH_DOSSIER
     )
+    dossier = _apply_expert_notes(dossier, expert_notes)
     expert = ExpertReasoner(
         qwen, EXPERT_PERSONA_CELLVIT, dossier,
         forbidden_values=[int(v) for v in ground_truth_counts_by_type.values()]
@@ -1592,14 +1618,17 @@ def run_deepgleason_with_feedback(
     qwen: QwenVLM, deepgleason_client: DeepGleasonClient, slide_path: str, task_description: str,
     max_iterations: int, output_dir: Path,
     ground_truth_gleason_score: str | None = None, ground_truth_isup_grade: int | None = None,
-    image_id: str | None = None,
+    image_id: str | None = None, expert_notes: str = "",
 ) -> dict:
     """The manager always consults a private ExpertReasoner (never shown ground truth itself --
     see module docstring) via a multi-turn dialogue (run_expert_dialogue) and decides
     accept/reject itself from the transcript (decide_deepgleason_from_dialogue), whether or not
     ground_truth_gleason_score/ground_truth_isup_grade are given. When they aren't, the expert
     has no private answer either -- NO_GROUND_TRUTH_DOSSIER tells it to reason from what's
-    actually visible in the overlay image, not fabricate a verdict.
+    actually visible in the overlay image, not fabricate a verdict. expert_notes (see
+    _apply_expert_notes) are accumulated guidance from previously human-resolved escalations
+    this run, folded into the dossier so the expert's own reasoning stays consistent across
+    images too, not just the manager's running_prompt.
 
     Unlike CountGD/StarDist/CellViT, this never reruns the underlying model on retry: the
     DeepGleason subprocess (expensive -- full WSI tiling + inference) runs exactly once, via
@@ -1621,6 +1650,7 @@ def run_deepgleason_with_feedback(
         if ground_truth_gleason_score is not None or ground_truth_isup_grade is not None
         else NO_GROUND_TRUTH_DOSSIER
     )
+    dossier = _apply_expert_notes(dossier, expert_notes)
     forbidden_values = [v for v in (ground_truth_gleason_score, ground_truth_isup_grade) if v is not None]
     expert = ExpertReasoner(qwen, EXPERT_PERSONA_DEEPGLEASON, dossier, forbidden_values=forbidden_values)
 
@@ -1740,6 +1770,7 @@ class ManagerAgent:
         ground_truth_counts_by_type: dict | None = None, ground_truth_class_labels: dict | None = None,
         ground_truth_gleason_score: str | None = None, ground_truth_isup_grade: int | None = None,
         tissue: str | None = None, image_id: str | None = None, slide_path: str | None = None,
+        expert_notes: str = "",
     ) -> dict:
         """ground_truth_count (CountGD), ground_truth_labels (StarDist),
         ground_truth_counts_by_type/ground_truth_class_labels (CellViT), and
@@ -1753,7 +1784,10 @@ class ManagerAgent:
         image_id defaults to the image's filename stem (see main()) if not given -- required for
         escalation (write_escalation) to fire for an unresolved case; without it, an unaccepted
         result is silently returned with no queued follow-up, for any caller, not just
-        train_manager.py.
+        train_manager.py. expert_notes (see _apply_expert_notes) are accumulated guidance from
+        previously human-resolved escalations, typically loaded from checkpoint.json by a caller
+        like train_manager.py or resolve_escalations.py -- empty by default (a live one-off CLI
+        call with no checkpoint to load from).
 
         slide_path is DeepGleason-specific: image_path itself must always be something Qwen's
         vision-language model can actually load for routing/select_agent (a normal-sized image),
@@ -1772,7 +1806,7 @@ class ManagerAgent:
         if agent == "countgd":
             return run_countgd_with_feedback(
                 self.qwen, self.countgd_client, image_path, task_description, max_iterations, out_dir,
-                ground_truth_count=ground_truth_count, image_id=image_id,
+                ground_truth_count=ground_truth_count, image_id=image_id, expert_notes=expert_notes,
             )
         if agent == "cellvit":
             return run_cellvit_with_feedback(
@@ -1780,17 +1814,17 @@ class ManagerAgent:
                 ground_truth_counts_by_type=ground_truth_counts_by_type,
                 ground_truth_class_labels=ground_truth_class_labels,
                 stardist_worker=self.stardist_worker if ground_truth_class_labels is not None else None,
-                tissue=tissue, image_id=image_id,
+                tissue=tissue, image_id=image_id, expert_notes=expert_notes,
             )
         if agent == "deepgleason":
             return run_deepgleason_with_feedback(
                 self.qwen, self.deepgleason_client, slide_path or image_path, task_description, max_iterations,
                 out_dir, ground_truth_gleason_score=ground_truth_gleason_score,
-                ground_truth_isup_grade=ground_truth_isup_grade, image_id=image_id,
+                ground_truth_isup_grade=ground_truth_isup_grade, image_id=image_id, expert_notes=expert_notes,
             )
         return run_stardist_with_feedback(
             self.qwen, self.stardist_worker, image_path, task_description, max_iterations, out_dir,
-            ground_truth_labels=ground_truth_labels, tissue=tissue, image_id=image_id,
+            ground_truth_labels=ground_truth_labels, tissue=tissue, image_id=image_id, expert_notes=expert_notes,
         )
 
 

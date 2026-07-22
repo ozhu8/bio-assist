@@ -13,9 +13,14 @@ ExpertReasoner used during training, still privately holding ground truth) leads
 specific, case-relevant question about the image (ask_human_question) rather than you guessing
 what to say into a blank prompt, the same role the manager plays with the expert during training,
 just with you standing in for the manager. Answer each question; an empty answer ends the
-conversation. The expert then summarizes it into transferable guidance and it gets folded into
-the run's running_prompt (checkpoint.json) via merge_escalation_feedback, the same
-keep-what-holds/drop-what's-contradicted merge summarize_and_merge already does every batch.
+conversation. The expert then summarizes it into transferable guidance, and your answer ends up
+updating TWO persistent things in checkpoint.json, not just one: the manager's running_prompt
+(via merge_escalation_feedback) and the expert's own expert_notes (via merge_expert_notes) --
+both the same keep-what-holds/drop-what's-contradicted merge summarize_and_merge already does
+every batch, just aimed at two different readers. expert_notes get folded into every future
+ExpertReasoner's private dossier (manager_agent._apply_expert_notes, used both here and in every
+run_*_with_feedback loop) -- so a correction a human makes on one image also informs how the
+expert reasons about *other* images later in the same run, not just how the manager tunes.
 
 Usage:
     python resolve_escalations.py --output-dir ./train_manager_output_7-21
@@ -28,10 +33,10 @@ import numpy as np  # pyright: ignore[reportMissingImports]
 
 from manager_agent import (
     EXPERT_PERSONA_CELLVIT, EXPERT_PERSONA_COUNTGD, EXPERT_PERSONA_DEEPGLEASON, EXPERT_PERSONA_STARDIST,
-    MODEL_ID, NO_GROUND_TRUTH_DOSSIER, ExpertReasoner, QwenVLM, build_cellvit_dossier, build_countgd_dossier,
-    build_deepgleason_dossier, build_stardist_dossier, run_human_expert_dialogue,
+    MODEL_ID, NO_GROUND_TRUTH_DOSSIER, ExpertReasoner, QwenVLM, _apply_expert_notes, build_cellvit_dossier,
+    build_countgd_dossier, build_deepgleason_dossier, build_stardist_dossier, run_human_expert_dialogue,
 )
-from train_manager import merge_escalation_feedback
+from train_manager import merge_escalation_feedback, merge_expert_notes
 
 # NO_GROUND_TRUTH_DOSSIER (imported above) is used when an escalation came from a run with no
 # ground truth at all -- write_escalation stores None for ground_truth_path/ground_truth_value in
@@ -57,12 +62,18 @@ def resolve_one(qwen: QwenVLM, record_path: Path, record: dict, checkpoint_path:
     print(f"Final output image: {record['final_image_path']}")
     print("Open the image above yourself -- the expert will ask you about specific things in it.\n")
 
+    # Read fresh (not cached at program start) so an escalation resolved earlier in this same
+    # session -- or by a train_manager.py run still going concurrently -- is already reflected:
+    # expert_notes accumulates across every escalation resolved, not just this one.
+    expert_notes = json.loads(checkpoint_path.read_text()).get("expert_notes", "")
+
     if record["agent"] == "stardist":
         ground_truth_labels = np.load(record["ground_truth_path"]) if record.get("ground_truth_path") else None
         dossier = (
             build_stardist_dossier(ground_truth_labels, record.get("tissue"))
             if ground_truth_labels is not None else NO_GROUND_TRUTH_DOSSIER
         )
+        dossier = _apply_expert_notes(dossier, expert_notes)
         expert = ExpertReasoner(
             qwen, EXPERT_PERSONA_STARDIST, dossier,
             forbidden_values=[int(ground_truth_labels.max())] if ground_truth_labels is not None else [],
@@ -73,6 +84,7 @@ def resolve_one(qwen: QwenVLM, record_path: Path, record: dict, checkpoint_path:
             build_cellvit_dossier(ground_truth_counts_by_type, record.get("tissue"))
             if ground_truth_counts_by_type is not None else NO_GROUND_TRUTH_DOSSIER
         )
+        dossier = _apply_expert_notes(dossier, expert_notes)
         expert = ExpertReasoner(
             qwen, EXPERT_PERSONA_CELLVIT, dossier,
             forbidden_values=[int(v) for v in ground_truth_counts_by_type.values()]
@@ -86,6 +98,7 @@ def resolve_one(qwen: QwenVLM, record_path: Path, record: dict, checkpoint_path:
             build_deepgleason_dossier(gleason_score, isup_grade)
             if gleason_score is not None or isup_grade is not None else NO_GROUND_TRUTH_DOSSIER
         )
+        dossier = _apply_expert_notes(dossier, expert_notes)
         expert = ExpertReasoner(
             qwen, EXPERT_PERSONA_DEEPGLEASON, dossier,
             forbidden_values=[v for v in (gleason_score, isup_grade) if v is not None],
@@ -96,6 +109,7 @@ def resolve_one(qwen: QwenVLM, record_path: Path, record: dict, checkpoint_path:
             build_countgd_dossier(ground_truth_count, record["original_image_path"])
             if ground_truth_count is not None else NO_GROUND_TRUTH_DOSSIER
         )
+        dossier = _apply_expert_notes(dossier, expert_notes)
         expert = ExpertReasoner(
             qwen, EXPERT_PERSONA_COUNTGD, dossier,
             forbidden_values=[ground_truth_count] if ground_truth_count is not None else [],
@@ -109,12 +123,18 @@ def resolve_one(qwen: QwenVLM, record_path: Path, record: dict, checkpoint_path:
     expert_summary = expert.summarize_for_manager(record["task_description"], image_id, conversation)
     print(f"\n[expert -> manager] {expert_summary}")
 
+    # Re-read (not the expert_notes snapshot from above) to shrink the window for clobbering a
+    # concurrent train_manager.py checkpoint write -- same reasoning as the pre-existing
+    # running_prompt re-read this already did before this change.
     checkpoint = json.loads(checkpoint_path.read_text())
     checkpoint["running_prompt"] = merge_escalation_feedback(
         qwen, checkpoint["running_prompt"], image_id, expert_summary
     )
+    checkpoint["expert_notes"] = merge_expert_notes(
+        qwen, checkpoint.get("expert_notes", ""), image_id, expert_summary
+    )
     checkpoint_path.write_text(json.dumps(checkpoint, indent=2, default=str))
-    print(f"Merged into {checkpoint_path}'s running prompt.")
+    print(f"Merged into {checkpoint_path}'s running prompt and expert notes.")
 
     record["status"] = "resolved"
     record["human_conversation"] = conversation
