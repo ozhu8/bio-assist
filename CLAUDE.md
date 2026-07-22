@@ -29,100 +29,12 @@ python -m venv .venv-stardist
 at import time, not declared as a pip dependency, so it must be installed
 explicitly or you'll get `RuntimeError: Please install TensorFlow`.
 
-### `.venv-btrack` -- for `agentic_btrack.py`
-```
-python -m venv .venv-btrack
-.venv-btrack/Scripts/pip install anthropic matplotlib pillow numpy scikit-image tifffile imagecodecs btrack stardist csbdeep tensorflow fsspec aiohttp
-```
-Needs `stardist`/`csbdeep`/`tensorflow` for the same reason `manager_agent.py` does
-(same gotcha as above): it imports `run_stardist` from `agentic_stardist.py` at
-module load time, to segment each frame before btrack links them across time --
-and since that pulls in all of `agentic_stardist.py`'s own imports too, it also
-needs `fsspec`/`aiohttp` (the PanNuke partial-read deps `agentic_stardist.py`
-uses) even though `agentic_btrack.py` itself never touches PanNuke. Needs
-`imagecodecs` too -- Cell Tracking Challenge's raw/GT TIFFs are LZW-compressed,
-and `tifffile.imread` raises `ValueError: <COMPRESSION.LZW: 5> requires the
-'imagecodecs' package` without it.
-
-**On Apple Silicon, build this venv with a native arm64 Python, not an
-Intel/x86_64 one.** `python -m venv` on macOS uses whatever `python`/`python3`
-resolves to on `PATH` -- if that happens to be an x86_64-only build (e.g. an old
-`/Library/Frameworks/Python.framework` install), every run goes through Rosetta
-2, and Rosetta's one-time ahead-of-time translation of TensorFlow's ~700MB
-`libtensorflow_cc.2.dylib` took 13+ minutes and then hung in an uninterruptible
-kernel wait (`ps` showed `UE` state, not even killable with `kill -9`) before
-this was caught. Check with `file $(which python3)` before creating the venv
-(want `arm64`, not `x86_64`); `/opt/anaconda3/bin/python3` was the arm64 option
-on this machine. Rebuilding the venv with that interpreter dropped the same
-import from 13+ minutes (hung) to ~4s warm / ~57s cold.
-
-**`import btrack` alone does not expose `btrack.datasets`** -- `btrack/__init__.py`
-(as of btrack 0.7.0) only imports `BayesianTracker`, not the `datasets`
-submodule, even though `btrack.datasets.cell_config()` (used to fetch the
-default tracker config) is real, documented API. Fixed in `agentic_btrack.py`
-by adding an explicit `import btrack.datasets` alongside `import btrack`.
-
-Verified end-to-end 2026-07-17: `--images-dir` against a synthetic 6-frame/
-5-blob sequence (generated locally, not part of the repo) correctly produced 5
-tracks whose plotted trajectories matched each blob's actual direction of
-motion, plus a PDF report and `.h5` tracks file.
-
-**`PyTrackObject.label` is NOT the source segmentation's per-frame instance/region
-ID, despite the name** -- it's a classification *state* field that defaults to
-`constants.States.NULL` for every object unless `segmentation_to_objects` is
-called with `assign_class_ID=True`. Every object came back with the identical
-`label` value regardless of which region it was built from -- confirmed by direct
-inspection (`obj.label` was `5` for all 130 objects across 3 frames of visibly
-different regions). This silently broke the (frame, label) -> btrack track ID
-mapping `agentic_btrack.py`'s ground-truth scoring depends on (`pred_track_id_map`
-had 2 entries instead of 86). Fixed in `track_sequence` by reconstructing each
-object's original label from its 1-indexed position among objects sharing its
-frame instead -- valid because `segmentation_to_objects` processes frames
-strictly in order (single worker by default) and regionprops visits labels in
-ascending order with no gaps (StarDist's own convention).
-
-**Even with that fixed, `--ctc-dataset` tracking accuracy against ground truth is
-currently bad (link_accuracy ~0), and it's NOT a script bug -- `max_search_radius`
-does not act as a hard cutoff on link distance.** Tested directly against 3 frames
-of `Fluo-N2DL-HeLa` (true same-cell displacement ~1-2px there): `max_search_radius=5`
-and `max_search_radius=100` produced near-identical results -- same 43 links, same
-973.8px maximum link distance, same ~370px mean. Whatever's actually gating which
-objects get linked together is coming from elsewhere in `cell_config.json` (most
-likely the motion model's own process/measurement noise parameters), not the
-`max_search_radius` knob `agentic_btrack.py`'s retry loop (`propose_search_radius`)
-is built around -- so as currently written, that retry loop will not converge to
-good tracking on this dataset no matter how many iterations it runs, since it's
-tuning a parameter that isn't the actual lever. **Paused here, not fixed**: the
-real fix would mean investigating/retuning `cell_config.json`'s motion-model noise
-parameters directly (its example config is presumably tuned for a reference
-dataset with a very different displacement scale than this one), which is a
-larger, more open-ended task than the mapping bug above. `imagecodecs` had to be
-added too (see the install command above) to read Cell Tracking Challenge's
-LZW-compressed TIFFs.
-
-**On this Windows/OneDrive checkout specifically**, built at
-`C:\Users\hanna\venvs\bio-assist\.venv-btrack` instead of `.venv-btrack` in the
-repo root like the others -- deliberately outside the OneDrive-synced folder, to
-avoid repeating the quota problem noted above (`tensorflow` alone is well over
-500MB). Run scripts by pointing at that interpreter directly from the repo root,
-e.g. `"C:\Users\hanna\venvs\bio-assist\.venv-btrack\Scripts\python" agentic_btrack.py ...`
-Worth doing the same for the other three venvs next time they need recreating.
-Also hit, and worked around without any system changes: `StarDist2D.from_pretrained`
-tries to `symlink_to` its extracted model cache (`csbdeep`'s `get_model_folder`,
-keras >= 3.6.0 codepath) and Windows requires either admin rights or Developer
-Mode for unprivileged symlinks -- `OSError: [WinError 1314] A required privilege
-is not held by the client`. Since the target content is already sitting right
-there under the `*_extracted` suffix, a plain recursive copy to the non-suffixed
-name (`cp -r ..._extracted ...` with the suffix stripped, under
-`~/.keras/models/StarDist2D/<model>/`) satisfies the `path_folder.exists()` check
-csbdeep does before attempting the symlink, so it's never attempted at all on
-subsequent runs.
-
 ### `.venv-manager` -- for `manager_agent.py` (Qwen3-VL manager)
 ```
 python -m venv .venv-manager
 .venv-manager/bin/pip install transformers accelerate qwen-vl-utils pillow gradio_client anthropic stardist csbdeep tensorflow aiohttp
 .venv-manager/bin/pip install pandas tqdm ujson einops pandarallel shapely opencv-python-headless numba pyyaml
+.venv-manager/bin/pip install pyvips
 .venv-manager/bin/pip install --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ torch torchvision
 ```
 The second `pip install` line (`pandas`/`tqdm`/`ujson`/`einops`/`pandarallel`/`shapely`/
@@ -137,6 +49,14 @@ this list, install that one specific package rather than the full requirements.t
 especially for numpy-version friction (deprecated aliases like `np.float`/`np.bool`, removed in
 newer numpy than CellViT was pinned against) and fix the specific call site rather than
 downgrading numpy repo-wide.
+
+`pyvips` (2026-07-22, for DeepGleason support -- see below) needs the system `libvips` library,
+not just the pip package -- already present on this machine (`/usr/bin/vips`, libvips 8.18.0,
+confirmed via `pyvips.version(0..2)` after install); on a machine without it, `apt install
+libvips-dev` (or equivalent) first. Only used here to downsample DeepGleason's pyramid BigTIFF
+overlay (and a whole-slide image itself, for the routing-preview thumbnail) into something
+small enough for Qwen to actually load -- `manager_agent.py` never runs the DeepGleason model
+itself in this process (see below), so this is the only new native dependency it needs.
 `torchvision` is needed too -- `qwen_vl_utils` imports it at module load time (`ModuleNotFoundError:
 No module named 'torchvision'` otherwise), even though nothing in this repo calls it directly.
 (`bin/`, not `Scripts/` -- this machine is Linux. `Scripts/` in older notes here was
@@ -272,16 +192,42 @@ stay isolated.
   misclassification -- there's no tunable knob for "the model called an Epithelial
   cell Neoplastic," and `decide_cellvit_from_dialogue`'s prompt says so explicitly
   so the manager doesn't hallucinate a fix that doesn't exist.
+- DeepGleason (`agentic_deepgleason.py`, added directly to GitHub by the repo owner rather than
+  written in an agent session) is a fourth routable agent (2026-07-22), with the same
+  ExpertReasoner/dialogue/escalation shape: `EXPERT_PERSONA_DEEPGLEASON`/
+  `build_deepgleason_dossier`/`decide_deepgleason_from_dialogue`/`run_deepgleason_with_feedback`.
+  Unlike the other three (all per-cell/per-nucleus tasks on a single tile-sized image),
+  DeepGleason grades a whole-slide prostate biopsy's tumor severity (Gleason score / ISUP grade
+  group 1-5) -- `select_agent`'s routing prompt sends "grade/stage this tumor" tasks here.
+  DeepGleason itself originally had no tunable parameter at all (just `idxmax` over its per-tile
+  softmax classification, always argmax regardless of confidence) -- `aggregate_gleason` gained
+  a `confidence_threshold` (a tile only counts toward Gleason-pattern tallying if its predicted
+  class's softmax probability clears the bar, otherwise it's "Uncertain") as the retry knob,
+  analogous to CellViT's `type_prob`/StarDist's `prob_thresh`. Real architectural asymmetry vs.
+  the other three: DeepGleason's underlying model call (`agentic_deepgleason.run_deepgleason`,
+  a `subprocess.run` into a wholly separate conda environment -- full WSI tiling + TensorFlow
+  inference over every tile) is expensive and produces a raw per-tile predictions CSV;
+  re-aggregating that CSV with a different `confidence_threshold` (`aggregate_gleason`) is cheap
+  and needs no rerun. `DeepGleasonClient.run_slide()` runs the subprocess exactly once per image;
+  every retry iteration only calls the cheap `.aggregate()`. No `StardistWorker`-style subprocess
+  isolation was needed here either, for a different reason than CellViT: DeepGleason is already
+  maximally isolated by construction (a real OS subprocess into a different Python/conda
+  environment entirely, not even the same interpreter family as `manager_agent.py`). Because
+  `main.py`'s DeepGleason forward pass runs over pyramid BigTIFFs, none of it is ever loaded
+  raw by Qwen -- `render_overlay_preview`/the CLI's routing-preview thumbnail both use `pyvips`
+  to extract a small, viewable PNG instead (see the `.venv-manager` section above).
+  **Scope decision, not yet done:** unlike PanNuke (StarDist/CellViT) or BBBC005 (CountGD),
+  there's no automated ground-truth dataset integration for DeepGleason in `train_manager.py`
+  -- the standard public source (the PANDA Gleason-grading challenge) is gigabytes-per-slide and
+  needs Kaggle credentials, a much bigger lift than PanNuke's partial-zip-read trick. Ground
+  truth is only suppliable manually right now (`--ground-truth-gleason-score`/
+  `--ground-truth-isup-grade` on `manager_agent.py`'s own CLI) -- a real training pipeline
+  against PANDA (or similar) is an explicit follow-up, deliberately scoped out for now rather
+  than left implicit. The DeepGleason conda environment/repo itself is also not yet set up on
+  this machine (needs `git clone` +
+  `git lfs pull` + a Python 3.11 conda env per `agentic_deepgleason.py`'s own docstring) --
+  `conda`/`git-lfs` are both already installed here, but the actual env/weights/end-to-end run
+  are still to be done.
 - No API key is required to run `manager_agent.py` -- Qwen runs locally, CountGD is
   a public hosted Gradio Space. The `anthropic` package is still a required import
   (transitively, via `agentic_countgd.py`/`agentic_stardist.py`) but is never called.
-- `agentic_btrack.py` follows the same CountGD/StarDist shape but tracks cells across
-  a frame sequence instead of scoring one image: it reuses `run_stardist` from
-  `agentic_stardist.py` unchanged to segment each frame, then runs btrack to link
-  those per-frame instances into tracks. Ground truth comes from Cell Tracking
-  Challenge (celltrackingchallenge.net) training sequences instead of PanNuke, scored
-  with a simplified link-accuracy proxy (not the official CTC TRA/AOGM metric -- see
-  the script's docstring and `compute_link_accuracy`). The retry knob is btrack's
-  `max_search_radius`, the only easily-revisable parameter, rather than StarDist's
-  prob_thresh/nms_thresh pair. Written but not yet run end-to-end -- see the
-  `.venv-btrack` note above.

@@ -1,7 +1,7 @@
 """
 Resolves cases train_manager.py/manager_agent.py queued for human review (write_escalation in
-manager_agent.py) -- written whenever an image's automated retry loop (CountGD, StarDist, or
-CellViT) exhausted its iterations without the manager ever reaching accept=True.
+manager_agent.py) -- written whenever an image's automated retry loop (CountGD, StarDist,
+CellViT, or DeepGleason) exhausted its iterations without the manager ever reaching accept=True.
 
 This is deliberately a separate, synchronous script rather than something the batch run itself
 blocks on: train_manager.py never waits for a human, it just queues the case and moves on to the
@@ -27,9 +27,9 @@ from pathlib import Path
 import numpy as np  # pyright: ignore[reportMissingImports]
 
 from manager_agent import (
-    EXPERT_PERSONA_CELLVIT, EXPERT_PERSONA_COUNTGD, EXPERT_PERSONA_STARDIST, MODEL_ID, NO_GROUND_TRUTH_DOSSIER,
-    ExpertReasoner, QwenVLM, build_cellvit_dossier, build_countgd_dossier, build_stardist_dossier,
-    run_human_expert_dialogue,
+    EXPERT_PERSONA_CELLVIT, EXPERT_PERSONA_COUNTGD, EXPERT_PERSONA_DEEPGLEASON, EXPERT_PERSONA_STARDIST,
+    MODEL_ID, NO_GROUND_TRUTH_DOSSIER, ExpertReasoner, QwenVLM, build_cellvit_dossier, build_countgd_dossier,
+    build_deepgleason_dossier, build_stardist_dossier, run_human_expert_dialogue,
 )
 from train_manager import merge_escalation_feedback
 
@@ -77,6 +77,18 @@ def resolve_one(qwen: QwenVLM, record_path: Path, record: dict, checkpoint_path:
             qwen, EXPERT_PERSONA_CELLVIT, dossier,
             forbidden_values=[int(v) for v in ground_truth_counts_by_type.values()]
             if ground_truth_counts_by_type is not None else [],
+        )
+    elif record["agent"] == "deepgleason":
+        ground_truth = record.get("ground_truth_value")  # {"gleason_score": ..., "isup_grade": ...} or None
+        gleason_score = ground_truth.get("gleason_score") if ground_truth else None
+        isup_grade = ground_truth.get("isup_grade") if ground_truth else None
+        dossier = (
+            build_deepgleason_dossier(gleason_score, isup_grade)
+            if gleason_score is not None or isup_grade is not None else NO_GROUND_TRUTH_DOSSIER
+        )
+        expert = ExpertReasoner(
+            qwen, EXPERT_PERSONA_DEEPGLEASON, dossier,
+            forbidden_values=[v for v in (gleason_score, isup_grade) if v is not None],
         )
     else:
         ground_truth_count = record.get("ground_truth_value")

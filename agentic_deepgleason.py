@@ -60,34 +60,54 @@ ISUP_GRADES = {
 }
 
 
-def run_deepgleason(slide_path: str, output_dir: Path) -> Path:
+def run_deepgleason(slide_path: str, output_dir: Path, generate_overlay: bool = False) -> tuple:
     """Runs DeepGleason's own CLI as a subprocess -- it's a separate,
     self-contained TensorFlow/AUCMEDI pipeline, not something to reimplement
-    -- and returns the path to its raw per-tile predictions CSV."""
+    -- and returns (predictions_path, overlay_path). This is the expensive
+    step (full WSI tiling + model inference over every tile); callers that
+    want to try several confidence_threshold values (see aggregate_gleason)
+    should call this once and re-aggregate from the same predictions CSV
+    rather than re-invoking the subprocess. overlay_path is None unless
+    generate_overlay=True -- DeepGleason only writes the classification
+    BigTIFF overlay when --generate_overlay is passed; the path is
+    predictable from its own naming convention (slide stem + "_gleason.tiff"
+    in output_dir, confirmed against code/main.py)."""
     predictions_path = output_dir / "predictions.csv"
-    subprocess.run(
-        [
-            DEEPGLEASON_PYTHON, str(DEEPGLEASON_REPO / "code" / "main.py"),
-            "--input", str(slide_path),
-            "--output", str(output_dir),
-            "--model", str(DEEPGLEASON_MODEL),
-            "--predictions", str(predictions_path),
-        ],
-        check=True,
-    )
-    return predictions_path
+    cmd = [
+        DEEPGLEASON_PYTHON, str(DEEPGLEASON_REPO / "code" / "main.py"),
+        "--input", str(slide_path),
+        "--output", str(output_dir),
+        "--model", str(DEEPGLEASON_MODEL),
+        "--predictions", str(predictions_path),
+    ]
+    overlay_path = None
+    if generate_overlay:
+        cmd.append("--generate_overlay")
+        slide_stem = Path(slide_path).stem
+        overlay_path = output_dir / f"{slide_stem}_gleason.tiff"
+    subprocess.run(cmd, check=True)
+    return predictions_path, overlay_path
 
 
-def aggregate_gleason(predictions_path: Path) -> dict:
+def aggregate_gleason(predictions_path: Path, confidence_threshold: float = 0.0) -> dict:
     """Turns DeepGleason's per-tile soft-label predictions into a standard
     clinical result: the predicted class per tile (argmax over TILE_CLASSES),
     primary/secondary Gleason pattern (the two most common tumor patterns by
     tile count -- standard practice when true tumor area isn't available),
     Gleason score (their sum, e.g. "3+4"), and ISUP grade group. Returns
     tumor_found=False (with everything else None) if no tile was classified
-    as any of G3/G4/G5."""
+    as any of G3/G4/G5.
+
+    confidence_threshold: a tile only counts toward tile_counts/tumor_counts
+    if its predicted class's softmax probability (the max over TILE_CLASSES,
+    not just whichever happens to be argmax) meets this bar -- otherwise it's
+    excluded as "Uncertain" rather than forced into whichever class edges out
+    the others. Default 0.0 always counts every tile (original behavior,
+    equivalent to plain argmax) since every probability is >= 0."""
     df = pd.read_csv(predictions_path, index_col=0)
+    confidence = df[TILE_CLASSES].max(axis=1)
     predicted_class = df[TILE_CLASSES].idxmax(axis=1)
+    predicted_class = predicted_class.where(confidence >= confidence_threshold, "Uncertain")
     tile_counts = predicted_class.value_counts().to_dict()
     tumor_counts = {cls: tile_counts.get(cls, 0) for cls in TUMOR_CLASSES}
 
@@ -109,20 +129,35 @@ def aggregate_gleason(predictions_path: Path) -> dict:
     }
 
 
-def run_tumor_detection(slide_path: str, output_dir) -> dict:
+def render_overlay_preview(overlay_tiff_path: Path, preview_path: Path, max_dim: int = 1024) -> None:
+    """Extracts a small, viewable PNG from DeepGleason's pyramid BigTIFF overlay -- the raw
+    BigTIFF itself isn't something an image-viewing model can be hand a path to directly.
+    pyvips (already a DeepGleason/main.py dependency, and confirmed present system-wide via
+    `vips --version` on this machine) reads the shrink-on-load thumbnail directly rather than
+    decoding the full pyramid level, which plain PIL.Image.open on a tiled BigTIFF does not
+    reliably support across libtiff builds."""
+    import pyvips  # pyright: ignore[reportMissingImports]
+    image = pyvips.Image.thumbnail(str(overlay_tiff_path), max_dim)
+    image.write_to_file(str(preview_path))
+
+
+def run_tumor_detection(slide_path: str, output_dir, confidence_threshold: float = 0.0) -> dict:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    predictions_path = run_deepgleason(slide_path, output_dir)
-    return aggregate_gleason(predictions_path)
+    predictions_path, _ = run_deepgleason(slide_path, output_dir)
+    return aggregate_gleason(predictions_path, confidence_threshold=confidence_threshold)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run DeepGleason + Gleason-score aggregation on a whole-slide image")
     parser.add_argument("--slide", required=True, help="Path to a whole-slide prostate pathology image (OME-TIFF)")
     parser.add_argument("--output-dir", default="./deepgleason_output")
+    parser.add_argument("--confidence-threshold", type=float, default=0.0,
+                         help="Minimum per-tile softmax probability to count a tile toward Gleason-pattern "
+                              "tallying; below it a tile is excluded as Uncertain. Default 0.0 = every tile counts.")
     args = parser.parse_args()
 
-    result = run_tumor_detection(args.slide, args.output_dir)
+    result = run_tumor_detection(args.slide, args.output_dir, confidence_threshold=args.confidence_threshold)
     if result["tumor_found"]:
         print(
             f"Tumor found: Gleason score {result['gleason_score']} "

@@ -221,7 +221,7 @@ def select_agent(qwen: QwenVLM, task_description: str, image_path: str) -> str:
     # nuclei/tissue images) -- worth spot-checking a few ambiguous prompts (e.g. "count the
     # nuclei in this tissue", with no type named, should land on stardist not cellvit).
     prompt = (
-        "You are a manager agent that routes an image-analysis task to one of three "
+        "You are a manager agent that routes an image-analysis task to one of four "
         "specialist tools:\n"
         "  - countgd: counts individual objects/cells matching a free-text description. Use it "
         "for \"how many of something\" tasks where the object type doesn't need pathology-"
@@ -235,14 +235,19 @@ def select_agent(qwen: QwenVLM, task_description: str, image_path: str) -> str:
         "more specific types. Use it whenever the task names or implies a SPECIFIC cell/nucleus "
         "type (e.g. \"how many inflammatory cells\", \"classify the tumor cells\", \"find the "
         "dead cells\", \"break down the nuclei by type\") -- anything requiring pathology-"
-        "relevant cell-type identification, not just a generic nucleus count.\n\n"
+        "relevant cell-type identification, not just a generic nucleus count.\n"
+        "  - deepgleason: grades prostate tumor severity (Gleason score / ISUP grade group) from "
+        "a whole-slide pathology image. Use it for tumor grading/staging tasks (e.g. \"what's the "
+        "Gleason score\", \"grade this biopsy\", \"how severe is this tumor\") -- distinct from "
+        "cell counting/segmentation/classification, this is a slide-level clinical severity "
+        "assessment, not a per-cell/per-nucleus task.\n\n"
         f"Task: \"{task_description}\"\n\n"
-        "Reply with ONLY a JSON object: {\"agent\": \"countgd\" or \"stardist\" or \"cellvit\", "
-        "\"reason\": \"one sentence\"}"
+        "Reply with ONLY a JSON object: {\"agent\": \"countgd\" or \"stardist\" or \"cellvit\" or "
+        "\"deepgleason\", \"reason\": \"one sentence\"}"
     )
     result = qwen.ask_json(image_path, prompt)
     agent = result.get("agent", "").strip().lower()
-    if agent not in ("countgd", "stardist", "cellvit"):
+    if agent not in ("countgd", "stardist", "cellvit", "deepgleason"):
         raise ValueError(f"Qwen returned an unrecognized agent choice: {result!r}")
     return agent
 
@@ -258,7 +263,7 @@ def interpret_countgd_target(qwen: QwenVLM, task_description: str, image_path: s
 
 _GROUND_TRUTH_HISTORY_KEYS = {
     "pq", "mean_iou", "tp", "fp", "fn", "internal_would_accept", "internal_recall", "internal_mae",
-    "internal_mpq", "internal_f1", "per_class_scores",
+    "internal_mpq", "internal_f1", "per_class_scores", "internal_isup_mae",
 }
 
 
@@ -392,6 +397,50 @@ def decide_cellvit_from_dialogue(
     return qwen.ask_json(annotated_image_path, prompt, max_new_tokens=900, required_keys=["accept", "feedback"])
 
 
+def decide_deepgleason_from_dialogue(
+    qwen: QwenVLM, task_description: str, confidence_threshold: float, gleason_result: dict,
+    dialogue: list, overlay_image_path: str, history: list,
+) -> dict:
+    """Ground truth is never given to the manager (see module docstring) -- instead the manager
+    has just talked to ExpertReasoner (run_expert_dialogue) and decides accept/reject itself from
+    that transcript plus the overlay image, proposing a revised confidence_threshold if
+    rejecting. confidence_threshold is DeepGleason's one tunable lever here (see
+    DeepGleasonClient/run_deepgleason_with_feedback): raising it excludes more low-confidence
+    tiles from Gleason-pattern tallying (fixes spurious/uncertain tiles being counted), lowering
+    it includes more borderline tiles (fixes a genuine tumor pattern being excluded as
+    Uncertain). Like CellViT's target_classes/prob_threshold, it can only fix which tiles count
+    toward the grade -- it cannot fix a confidently-wrong per-tile classification; there is no
+    tunable lever for that here, so the prompt says so explicitly."""
+    prompt = (
+        f"Original user request: \"{task_description}\"\n"
+        f"DeepGleason ran with confidence_threshold={confidence_threshold:.2f}\n"
+        f"Result: {json.dumps(gleason_result, default=str)}\n"
+        f"Your conversation with the domain expert this iteration:\n{json.dumps(dialogue, default=str)}\n"
+        f"Prior attempts this session: {json.dumps(_redact_history_for_manager(history), default=str)}\n"
+        "Compare this attempt against those prior ones: did the dialogue's findings actually "
+        "improve, or did the last threshold change not help (or make things worse)? Don't "
+        "assume a later attempt is better just because it came later.\n\n"
+        "First, classify each numbered turn in the conversation above as exactly one of: "
+        "excluded_pattern (expert confirmed a region genuinely shows a Gleason growth pattern "
+        "that's being excluded from the grade as low-confidence/Uncertain), spurious_included "
+        "(expert suggested a region counted toward the grade doesn't actually look like a "
+        "confident tumor pattern), no_issue (expert confirmed the region's classification and "
+        "inclusion/exclusion was correct), or ambiguous. List these as turn_analysis.\n\n"
+        "Then decide whether this result satisfies the request. Note: confidence_threshold can "
+        "only fix which tiles count toward the grade (excluding uncertain ones, or including "
+        "borderline ones) -- it CANNOT fix a tile being confidently misclassified as the wrong "
+        "growth pattern; there is no adjustable lever for that here. So: if most flagged turns "
+        "are excluded_pattern, propose a LOWER confidence_threshold (includes more borderline "
+        "tiles). If most flagged turns are spurious_included, propose a HIGHER "
+        "confidence_threshold (excludes more uncertain tiles). Don't reject solely because of a "
+        "single ambiguous turn when everything else checks out.\n\n"
+        "Reply with ONLY a JSON object matching this schema: {\"turn_analysis\": "
+        "[{\"turn\": int, \"verdict\": \"excluded_pattern\"|\"spurious_included\"|\"no_issue\"|\"ambiguous\"}], "
+        "\"accept\": bool, \"feedback\": str (1-2 sentences), \"revised_confidence_threshold\": number or null}"
+    )
+    return qwen.ask_json(overlay_image_path, prompt, max_new_tokens=900, required_keys=["accept", "feedback"])
+
+
 EXPERT_PERSONA_COUNTGD = (
     "You are a senior quantitative image-analysis scientist who manually verified the true "
     "object count in this image as part of a ground-truth annotation study. You are acting as "
@@ -456,6 +505,29 @@ EXPERT_PERSONA_CELLVIT = (
     "2-4 sentences."
 )
 
+EXPERT_PERSONA_DEEPGLEASON = (
+    "You are a senior genitourinary pathologist who manually graded this prostate biopsy's true "
+    "Gleason score and ISUP grade group as part of a ground-truth annotation study. You are "
+    "acting as a mentor answering a junior colleague's question about a specific automated "
+    "grading run -- you are NOT a scorer, and your job is NOT to simply hand them the answer. "
+    "Never state the true Gleason score or ISUP grade group as a number, never say whether the "
+    "overall result is 'correct', 'accepted', 'right', or 'wrong', never use the words "
+    "'accept'/'reject', and do NOT declare a verdict yourself (do not say things like 'that's "
+    "Gleason pattern 4').\n\n"
+    "Instead, for the SPECIFIC region asked about, point out the concrete, checkable "
+    "morphological evidence that IS or ISN'T actually present there -- grounded in the true "
+    "grading you're privately holding for that region -- so your colleague can weigh it and "
+    "reach their own conclusion. Good evidence is specific to this exact spot, e.g. 'those "
+    "glands there have lost their well-formed lumina and are fusing into cribriform sheets, "
+    "which is a higher-grade pattern than the discrete round glands elsewhere' or 'that region "
+    "still shows individually separate, round-to-oval glands with clear lumina, consistent with "
+    "a lower-grade pattern rather than the poorly-formed glands nearby' or 'there's no "
+    "infiltrative single-cell or cord-like growth in that area, unlike the clearly infiltrative "
+    "pattern in the adjacent focus.' Do not describe what a pathologist 'would' generally look "
+    "for in the abstract, and do not simply state your conclusion -- describe the actual "
+    "evidence present in this specific region, in 2-4 sentences."
+)
+
 
 def _parse_bbbc005_metadata(image_path: str) -> dict | None:
     """BBBC005 filenames encode focus level and stain channel, e.g.
@@ -512,6 +584,15 @@ def build_cellvit_dossier(ground_truth_counts_by_type: dict, tissue: str | None 
     if tissue:
         lines.append(f"[PRIVATE -- general tissue knowledge OK to reference] Tissue type: {tissue}.")
     return "\n".join(lines)
+
+
+def build_deepgleason_dossier(ground_truth_gleason_score: str | None, ground_truth_isup_grade: int | None) -> str:
+    lines = ["[PRIVATE -- never reveal] Verified true grading:"]
+    if ground_truth_gleason_score is not None:
+        lines.append(f"Gleason score {ground_truth_gleason_score}.")
+    if ground_truth_isup_grade is not None:
+        lines.append(f"ISUP grade group {ground_truth_isup_grade}.")
+    return " ".join(lines)
 
 
 EXPERT_LEAK_FALLBACK = (
@@ -1126,6 +1207,57 @@ class CellvitClient:
         return run_cellvit(inferer, image_path, self.magnification, target_classes, prob_threshold, color_dict)
 
 
+class DeepGleasonClient:
+    """Unlike CellViT/StarDist, DeepGleason is already maximally isolated by construction --
+    agentic_deepgleason.run_deepgleason shells out via subprocess.run to a wholly separate conda
+    environment's interpreter (Python 3.11, pinned TensorFlow/AUCMEDI), not even the same Python
+    family as this process, so there's no StardistWorker-style LLVM-collision risk to design
+    around here.
+
+    The real asymmetry this class exists to handle: run_deepgleason (full WSI tiling + model
+    inference over every tile) is expensive and produces a raw per-tile predictions CSV;
+    re-aggregating that CSV with a different confidence_threshold (aggregate_gleason) is cheap
+    and needs no rerun. run_slide() does the expensive part once per image and caches the
+    resulting paths; aggregate() repeats the cheap part every retry iteration."""
+
+    def __init__(self, repo: str | None = None, python: str | None = None, model: str | None = None):
+        self.repo = repo
+        self.python = python
+        self.model = model
+        self._predictions_path = None
+        self._overlay_path = None
+        self._preview_path = None
+
+    def _configure_module(self):
+        import agentic_deepgleason as dg
+        if self.repo:
+            dg.DEEPGLEASON_REPO = Path(self.repo)
+            dg.DEEPGLEASON_MODEL = Path(self.repo) / "models" / "model.ConvNeXtBase.hdf5"
+        if self.model:
+            dg.DEEPGLEASON_MODEL = Path(self.model)
+        if self.python:
+            dg.DEEPGLEASON_PYTHON = self.python
+        return dg
+
+    def run_slide(self, slide_path: str, output_dir: Path) -> None:
+        """Runs the expensive DeepGleason subprocess once; caches predictions_path/overlay_path/
+        preview_path for aggregate() to reuse across iterations."""
+        dg = self._configure_module()
+        self._predictions_path, self._overlay_path = dg.run_deepgleason(slide_path, output_dir, generate_overlay=True)
+        self._preview_path = output_dir / "gleason_overlay_preview.png"
+        dg.render_overlay_preview(self._overlay_path, self._preview_path)
+
+    def aggregate(self, confidence_threshold: float) -> dict:
+        assert self._predictions_path is not None, "run_slide must be called before aggregate"
+        dg = self._configure_module()
+        return dg.aggregate_gleason(self._predictions_path, confidence_threshold=confidence_threshold)
+
+    @property
+    def preview_path(self) -> Path:
+        assert self._preview_path is not None, "run_slide must be called before preview_path is available"
+        return self._preview_path
+
+
 ESCALATION_QUEUE_DIRNAME = "escalation_queue"
 
 
@@ -1453,6 +1585,101 @@ def run_cellvit_with_feedback(
     }
 
 
+DEEPGLEASON_INITIAL_CONFIDENCE_THRESHOLD = 0.0  # 0.0 = every tile counts (DeepGleason's own default behavior)
+
+
+def run_deepgleason_with_feedback(
+    qwen: QwenVLM, deepgleason_client: DeepGleasonClient, slide_path: str, task_description: str,
+    max_iterations: int, output_dir: Path,
+    ground_truth_gleason_score: str | None = None, ground_truth_isup_grade: int | None = None,
+    image_id: str | None = None,
+) -> dict:
+    """The manager always consults a private ExpertReasoner (never shown ground truth itself --
+    see module docstring) via a multi-turn dialogue (run_expert_dialogue) and decides
+    accept/reject itself from the transcript (decide_deepgleason_from_dialogue), whether or not
+    ground_truth_gleason_score/ground_truth_isup_grade are given. When they aren't, the expert
+    has no private answer either -- NO_GROUND_TRUTH_DOSSIER tells it to reason from what's
+    actually visible in the overlay image, not fabricate a verdict.
+
+    Unlike CountGD/StarDist/CellViT, this never reruns the underlying model on retry: the
+    DeepGleason subprocess (expensive -- full WSI tiling + inference) runs exactly once, via
+    deepgleason_client.run_slide(); every iteration only re-aggregates the same cached
+    predictions CSV with a revised confidence_threshold (cheap -- see DeepGleasonClient).
+
+    Internal metric when ground truth is given: internal_isup_mae = abs(predicted_isup_grade -
+    ground_truth_isup_grade), logged only, never used for the decision (same role as
+    internal_mae/internal_pq elsewhere). "No tumor found" is treated as ISUP grade 0 for this
+    purpose -- an ordinal extension, since no tumor is less severe than any graded one. If the
+    loop never reaches accept=True, the case is queued for human review (write_escalation) --
+    requires image_id."""
+    deepgleason_client.run_slide(slide_path, output_dir)
+    preview_path = deepgleason_client.preview_path
+    confidence_threshold = DEEPGLEASON_INITIAL_CONFIDENCE_THRESHOLD
+
+    dossier = (
+        build_deepgleason_dossier(ground_truth_gleason_score, ground_truth_isup_grade)
+        if ground_truth_gleason_score is not None or ground_truth_isup_grade is not None
+        else NO_GROUND_TRUTH_DOSSIER
+    )
+    forbidden_values = [v for v in (ground_truth_gleason_score, ground_truth_isup_grade) if v is not None]
+    expert = ExpertReasoner(qwen, EXPERT_PERSONA_DEEPGLEASON, dossier, forbidden_values=forbidden_values)
+
+    history = []
+    for i in range(1, max_iterations + 1):
+        print(f"--- Iteration {i}: DeepGleason confidence_threshold={confidence_threshold:.2f} ---")
+        gleason_result = deepgleason_client.aggregate(confidence_threshold)
+        print(f"[DeepGleason] {gleason_result}")
+
+        dialogue = run_expert_dialogue(
+            qwen, expert, task_description,
+            f"confidence_threshold={confidence_threshold:.2f}; result={gleason_result}",
+            str(preview_path), [str(preview_path)],
+        )
+        decision = decide_deepgleason_from_dialogue(
+            qwen, task_description, confidence_threshold, gleason_result, dialogue, str(preview_path), history,
+        )
+        accept = decision["accept"]
+        revised_threshold = decision.get("revised_confidence_threshold")
+        feedback = decision["feedback"]
+
+        entry = {
+            "iteration": i, "confidence_threshold": confidence_threshold, "gleason_result": gleason_result,
+            "dialogue": dialogue, "accept": accept, "feedback": feedback,
+        }
+        if ground_truth_isup_grade is not None:
+            predicted_grade = gleason_result["isup_grade"] if gleason_result["tumor_found"] else 0
+            internal_isup_mae = abs(predicted_grade - ground_truth_isup_grade)
+            print(f"[manager] accept={accept}  (internal_isup_mae={internal_isup_mae})")
+            entry["internal_isup_mae"] = internal_isup_mae
+        else:
+            print(f"[manager] accept={accept}")
+        history.append(entry)
+
+        if revised_threshold is not None and abs(revised_threshold - confidence_threshold) < 1e-9:
+            revised_threshold = None
+        if accept or revised_threshold is None:
+            break
+        confidence_threshold = revised_threshold
+
+    # No choose_best_output here, unlike CountGD/StarDist/CellViT: those rerun their full model
+    # each iteration and can produce genuinely different (sometimes non-monotonically better/
+    # worse) visual outputs to compare. Here every iteration re-aggregates the exact same cached
+    # predictions CSV against the exact same overlay image -- only the numeric gleason_result
+    # changes, not anything to visually compare -- so the last iteration's result is simply used.
+    if not history[-1]["accept"] and image_id is not None:
+        ground_truth = None
+        if ground_truth_gleason_score is not None or ground_truth_isup_grade is not None:
+            ground_truth = {"gleason_score": ground_truth_gleason_score, "isup_grade": ground_truth_isup_grade}
+        write_escalation(
+            output_dir, image_id, "deepgleason", task_description, slide_path, preview_path, history, ground_truth,
+        )
+    return {
+        "agent": "deepgleason", "confidence_threshold": confidence_threshold,
+        "gleason_result": history[-1]["gleason_result"], "overlay_preview": preview_path,
+        "history": history, "chosen_iteration": history[-1]["iteration"],
+    }
+
+
 class ManagerAgent:
     """Routes a task to CountGD, StarDist, or CellViT using Qwen3-VL, and drives Qwen's own
     retry/scoring loop against whichever agent it picked."""
@@ -1460,15 +1687,21 @@ class ManagerAgent:
     def __init__(
         self, model_id: str = MODEL_ID, cellvit_checkpoint: str | None = None,
         cellvit_repo: str | None = None, cellvit_gpu: int = 0, cellvit_magnification: float = 40.0,
+        deepgleason_repo: str | None = None, deepgleason_python: str | None = None,
+        deepgleason_model: str | None = None,
     ):
         self.qwen = QwenVLM(model_id)
         self._countgd_client = None
         self._stardist_worker = None
         self._cellvit_client = None
+        self._deepgleason_client = None
         self.cellvit_checkpoint = cellvit_checkpoint
         self.cellvit_repo = cellvit_repo
         self.cellvit_gpu = cellvit_gpu
         self.cellvit_magnification = cellvit_magnification
+        self.deepgleason_repo = deepgleason_repo
+        self.deepgleason_python = deepgleason_python
+        self.deepgleason_model = deepgleason_model
 
     @property
     def countgd_client(self) -> Client:
@@ -1492,28 +1725,46 @@ class ManagerAgent:
             )
         return self._cellvit_client
 
+    @property
+    def deepgleason_client(self) -> DeepGleasonClient:
+        if self._deepgleason_client is None:
+            self._deepgleason_client = DeepGleasonClient(
+                self.deepgleason_repo, self.deepgleason_python, self.deepgleason_model,
+            )
+        return self._deepgleason_client
+
     def run(
         self, task_description: str, image_path: str, max_iterations: int = 5,
         output_dir: str = "./manager_agent_output",
         ground_truth_count: int | None = None, ground_truth_labels: np.ndarray | None = None,
         ground_truth_counts_by_type: dict | None = None, ground_truth_class_labels: dict | None = None,
-        tissue: str | None = None, image_id: str | None = None,
+        ground_truth_gleason_score: str | None = None, ground_truth_isup_grade: int | None = None,
+        tissue: str | None = None, image_id: str | None = None, slide_path: str | None = None,
     ) -> dict:
-        """ground_truth_count (CountGD), ground_truth_labels (StarDist), and
-        ground_truth_counts_by_type/ground_truth_class_labels (CellViT) are all optional -- see
-        run_countgd_with_feedback/run_stardist_with_feedback/run_cellvit_with_feedback for what
-        happens when the relevant one is left out (the manager still gets a full expert dialogue
-        either way, just without a private ground-truth answer backing it -- see module
-        docstring). None of them ever reach the manager itself -- they're handed to a private
-        ExpertReasoner instead. tissue (StarDist/CellViT, both PanNuke) is extra "expert" context,
-        not a ground truth value on its own. image_id defaults to the image's filename stem
-        (see main()) if not given -- required for escalation (write_escalation) to fire for an
-        unresolved case; without it, an unaccepted result is silently returned with no queued
-        follow-up, for any caller, not just train_manager.py."""
+        """ground_truth_count (CountGD), ground_truth_labels (StarDist),
+        ground_truth_counts_by_type/ground_truth_class_labels (CellViT), and
+        ground_truth_gleason_score/ground_truth_isup_grade (DeepGleason) are all optional -- see
+        run_countgd_with_feedback/run_stardist_with_feedback/run_cellvit_with_feedback/
+        run_deepgleason_with_feedback for what happens when the relevant one is left out (the
+        manager still gets a full expert dialogue either way, just without a private
+        ground-truth answer backing it -- see module docstring). None of them ever reach the
+        manager itself -- they're handed to a private ExpertReasoner instead. tissue (StarDist/
+        CellViT, both PanNuke) is extra "expert" context, not a ground truth value on its own.
+        image_id defaults to the image's filename stem (see main()) if not given -- required for
+        escalation (write_escalation) to fire for an unresolved case; without it, an unaccepted
+        result is silently returned with no queued follow-up, for any caller, not just
+        train_manager.py.
+
+        slide_path is DeepGleason-specific: image_path itself must always be something Qwen's
+        vision-language model can actually load for routing/select_agent (a normal-sized image),
+        never a raw whole-slide TIFF (often gigapixel) -- so for a WSI task, pass a small
+        downsampled preview as image_path and the real slide file as slide_path; only the
+        deepgleason branch below uses slide_path (falling back to image_path if omitted, for a
+        caller that already has a small enough slide)."""
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         if image_id is None:
-            image_id = Path(image_path).stem
+            image_id = Path(slide_path if slide_path else image_path).stem
 
         agent = select_agent(self.qwen, task_description, image_path)
         print(f"[Qwen] routed to: {agent}")
@@ -1531,6 +1782,12 @@ class ManagerAgent:
                 stardist_worker=self.stardist_worker if ground_truth_class_labels is not None else None,
                 tissue=tissue, image_id=image_id,
             )
+        if agent == "deepgleason":
+            return run_deepgleason_with_feedback(
+                self.qwen, self.deepgleason_client, slide_path or image_path, task_description, max_iterations,
+                out_dir, ground_truth_gleason_score=ground_truth_gleason_score,
+                ground_truth_isup_grade=ground_truth_isup_grade, image_id=image_id,
+            )
         return run_stardist_with_feedback(
             self.qwen, self.stardist_worker, image_path, task_description, max_iterations, out_dir,
             ground_truth_labels=ground_truth_labels, tissue=tissue, image_id=image_id,
@@ -1538,8 +1795,15 @@ class ManagerAgent:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Qwen3-VL-managed dispatch to CountGD, StarDist, or CellViT")
-    parser.add_argument("--image", default=None, help="Path to the input image (ignored if --pannuke-index is set)")
+    parser = argparse.ArgumentParser(description="Qwen3-VL-managed dispatch to CountGD, StarDist, CellViT, or DeepGleason")
+    parser.add_argument("--image", default=None, help="Path to the input image (ignored if --pannuke-index/--slide is set)")
+    parser.add_argument(
+        "--slide", default=None,
+        help="Path to a whole-slide pathology image (OME-TIFF) for DeepGleason tumor grading -- "
+             "mutually exclusive with --image/--pannuke-index. A small routing-preview thumbnail is "
+             "generated automatically (Qwen's routing step never gets handed the raw, often-gigapixel "
+             "slide directly)",
+    )
     parser.add_argument("--task", required=True, help="Task description, e.g. 'count the cells' or 'segment the nuclei'")
     parser.add_argument(
         "--ground-truth-count", type=int, default=None,
@@ -1578,9 +1842,23 @@ def main():
     parser.add_argument("--cellvit-checkpoint", default=None, help="Path to a CellViT model checkpoint (.pth) -- required if the task might route to CellViT")
     parser.add_argument("--cellvit-repo", default=None, help="Path to a local clone of TIO-IKIM/CellViT")
     parser.add_argument("--cellvit-gpu", type=int, default=0, help="CUDA/ROCm GPU id for CellViT inference")
+    parser.add_argument("--deepgleason-repo", default=None, help="Path to a local clone of frankkramer-lab/DeepGleason (defaults to ~/DeepGleason, see agentic_deepgleason.py)")
+    parser.add_argument("--deepgleason-python", default=None, help="Path to the Python interpreter in DeepGleason's own conda env (defaults to ~/.conda/envs/deepgleason/bin/python)")
+    parser.add_argument("--deepgleason-model", default=None, help="Path to a DeepGleason model checkpoint (defaults to <repo>/models/model.ConvNeXtBase.hdf5)")
+    parser.add_argument(
+        "--ground-truth-gleason-score", default=None,
+        help="Known true Gleason score (e.g. '3+4') -- if set and the task routes to DeepGleason, "
+             "this goes to a private ExpertReasoner instead of the manager, same as the other agents' "
+             "--ground-truth-* flags",
+    )
+    parser.add_argument(
+        "--ground-truth-isup-grade", type=int, default=None,
+        help="Known true ISUP grade group (1-5) -- same private-ExpertReasoner treatment as "
+             "--ground-truth-gleason-score; also backs the internal_isup_mae logging metric",
+    )
     args = parser.parse_args()
-    if args.image is None and args.pannuke_index is None:
-        parser.error("one of --image or --pannuke-index is required")
+    if args.image is None and args.pannuke_index is None and args.slide is None:
+        parser.error("one of --image, --pannuke-index, or --slide is required")
     if args.max_iterations < 1:
         parser.error("--max-iterations must be at least 1")
 
@@ -1590,14 +1868,23 @@ def main():
     manager = ManagerAgent(
         model_id=args.model_id, cellvit_checkpoint=args.cellvit_checkpoint,
         cellvit_repo=args.cellvit_repo, cellvit_gpu=args.cellvit_gpu,
+        deepgleason_repo=args.deepgleason_repo, deepgleason_python=args.deepgleason_python,
+        deepgleason_model=args.deepgleason_model,
     )
 
     image_path = args.image
+    slide_path = None
     ground_truth_labels = None
     ground_truth_counts_by_type = None
     ground_truth_class_labels = None
     tissue = None
-    if args.pannuke_index is not None:
+    if args.slide is not None:
+        import pyvips  # pyright: ignore[reportMissingImports]
+        slide_path = args.slide
+        image_path = str(output_dir / "slide_routing_preview.png")
+        pyvips.Image.thumbnail(slide_path, 512).write_to_file(image_path)
+        print(f"Generated routing preview {image_path} from {slide_path}")
+    elif args.pannuke_index is not None:
         print(f"Fetching PanNuke fold {args.pannuke_fold} image {args.pannuke_index}...")
         image, ground_truth_labels, tissue = manager.stardist_worker.load_pannuke_sample(
             args.pannuke_fold, args.pannuke_index
@@ -1615,12 +1902,15 @@ def main():
         if args.ground_truth_counts_by_type is not None:
             ground_truth_counts_by_type = json.loads(Path(args.ground_truth_counts_by_type).read_text())
 
-    assert image_path is not None, "one of --image or --pannuke-index is required"
+    assert image_path is not None, "one of --image, --pannuke-index, or --slide is required"
     result = manager.run(
         args.task, image_path, args.max_iterations, args.output_dir,
         ground_truth_count=args.ground_truth_count, ground_truth_labels=ground_truth_labels,
         ground_truth_counts_by_type=ground_truth_counts_by_type,
-        ground_truth_class_labels=ground_truth_class_labels, tissue=tissue,
+        ground_truth_class_labels=ground_truth_class_labels,
+        ground_truth_gleason_score=args.ground_truth_gleason_score,
+        ground_truth_isup_grade=args.ground_truth_isup_grade,
+        tissue=tissue, slide_path=slide_path,
     )
 
     print("\n=== Final result ===")
@@ -1634,6 +1924,10 @@ def main():
         print(f"Matched count: {result['count']}")
         print(f"All detected by type: {result['counts_by_type']}")
         print(f"Annotated image: {result['annotated_image']}")
+    elif result["agent"] == "deepgleason":
+        print(f"Confidence threshold: {result['confidence_threshold']:.2f}")
+        print(f"Gleason result: {result['gleason_result']}")
+        print(f"Overlay preview: {result['overlay_preview']}")
     else:
         print(f"Detected nuclei: {result['num_nuclei']}")
         print(f"Outlines image: {result['outlines_image']}")
