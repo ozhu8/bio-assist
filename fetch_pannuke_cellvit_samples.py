@@ -14,7 +14,6 @@ Usage:
 """
 import argparse
 import contextlib
-import io
 import json
 import random
 import zipfile
@@ -35,9 +34,15 @@ TISSUE_DIVERSITY_MAX_INDEX = 1500
 
 @contextlib.contextmanager
 def _open_pannuke_zip(fold: int, block_size: int | None = None):
+    """Passes the fsspec HTTP file handle straight to zipfile.ZipFile instead of calling
+    fp.read() to materialize it into an in-memory buffer first -- zipfile only seeks/reads the
+    central directory plus whatever members are actually opened, so this never downloads the
+    full ~700MB+ zip. An earlier version here called fp.read() unconditionally, which pulled
+    the entire remote zip into memory with no retry around it -- that unbounded whole-file read
+    is what produces FSTimeoutError on PanNuke's server (see agentic_stardist.py's identical
+    fetcher, which hit and fixed this same issue first)."""
     with fsspec.open(PANNUKE_FOLD_URL.format(fold=fold), mode="rb", block_size=block_size) as fp:  # type: ignore[assignment]
-        data = fp.read()  # type: ignore[attr-defined]
-        zf = zipfile.ZipFile(io.BytesIO(data))
+        zf = zipfile.ZipFile(fp)  # type: ignore[arg-type]
         try:
             yield zf
         finally:

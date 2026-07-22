@@ -187,7 +187,13 @@ def build_countgd_tasks(n: int, output_dir: Path) -> list:
 def build_stardist_tasks(manager: ManagerAgent, n: int, fold: int, output_dir: Path, seed: int = 0) -> list:
     """Uses StardistWorker.load_pannuke_diverse -- indices spread across as many PanNuke tissue
     types as possible, fetched in one batched read -- instead of the first n images (a single
-    contiguous tissue block) via n separate from-scratch reads."""
+    contiguous tissue block) via n separate from-scratch reads.
+
+    n <= 0 (a CountGD-only run, e.g. --stardist-n 0) returns no tasks without touching
+    manager.stardist_worker at all -- select_diverse_indices returns [] for n=0, and indexing
+    that empty list's last element is what used to raise IndexError here before this guard."""
+    if n <= 0:
+        return []
     indices, images, gt_labels_list, tissues = manager.stardist_worker.load_pannuke_diverse(fold, n, seed=seed)
     tasks = []
     for idx, image, ground_truth_labels, tissue in zip(indices, images, gt_labels_list, tissues):
