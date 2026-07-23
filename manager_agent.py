@@ -174,12 +174,12 @@ class QwenVLM:
             "content": [{"type": "image", "image": p} for p in image_paths] + [{"type": "text", "text": prompt}],
         }]
         chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, video_inputs = process_vision_info(messages)
+        image_inputs, video_inputs, _ = process_vision_info(messages, return_video_kwargs=True)
         inputs = processor(
             text=[chat_text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
         ).to(model.device)
 
-        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False) # pyright: ignore[reportAttributeAccessIssue]
         trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
         return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
 
@@ -218,7 +218,7 @@ class QwenVLM:
         chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = processor(text=[chat_text], padding=True, return_tensors="pt").to(model.device)
 
-        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False) # pyright: ignore[reportAttributeAccessIssue]
         trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
         return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
 
@@ -1945,7 +1945,7 @@ def main():
         import pyvips  # pyright: ignore[reportMissingImports]
         slide_path = args.slide
         image_path = str(output_dir / "slide_routing_preview.png")
-        pyvips.Image.thumbnail(slide_path, 512).write_to_file(image_path)
+        pyvips.Image.thumbnail(slide_path, 512).write_to_file(image_path)  # type: ignore[attr-defined] -- pyvips generates methods dynamically via __getattr__, no stubs
         print(f"Generated routing preview {image_path} from {slide_path}")
     elif args.pannuke_index is not None:
         print(f"Fetching PanNuke fold {args.pannuke_fold} image {args.pannuke_index}...")

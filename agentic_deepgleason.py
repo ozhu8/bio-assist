@@ -137,8 +137,10 @@ def render_overlay_preview(overlay_tiff_path: Path, preview_path: Path, max_dim:
     decoding the full pyramid level, which plain PIL.Image.open on a tiled BigTIFF does not
     reliably support across libtiff builds."""
     import pyvips  # pyright: ignore[reportMissingImports]
-    image = pyvips.Image.thumbnail(str(overlay_tiff_path), max_dim)
-    image.write_to_file(str(preview_path))
+    # pyvips generates methods dynamically via __getattr__ (no stubs), so Pylance can't infer
+    # thumbnail()'s return type and treats it as None -- it's a real vips Image at runtime.
+    image = pyvips.Image.thumbnail(str(overlay_tiff_path), max_dim)  # type: ignore[attr-defined]
+    image.write_to_file(str(preview_path) + "[compression=png]")  # type: ignore[attr-defined]
 
 
 def run_tumor_detection(slide_path: str, output_dir, confidence_threshold: float = 0.0) -> dict:

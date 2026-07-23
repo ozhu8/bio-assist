@@ -50,10 +50,9 @@ import random
 import textwrap
 import zipfile
 from pathlib import Path
-from typing import IO, Optional, Tuple, cast
+from typing import Optional, Tuple, cast
 
 import anthropic # pyright: ignore[reportMissingImports]
-from anthropic.types import ImageBlockParam # pyright: ignore[reportMissingImports]
 import fsspec # pyright: ignore[reportMissingImports]
 import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
 import numpy as np # pyright: ignore[reportMissingImports]
