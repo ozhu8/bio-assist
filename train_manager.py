@@ -237,11 +237,16 @@ def merge_expert_notes(qwen, expert_notes: str, image_id: str, expert_summary: s
     return qwen.ask_text(prompt, max_new_tokens=800).strip()
 
 
-def build_countgd_tasks(n: int, output_dir: Path, split: str = "all") -> list:
+def build_countgd_tasks(n: int, output_dir: Path, split: str = "all", blur: int = 1, stain: int = 1) -> list:
+    """blur/stain (same defaults as bbbc005.load_bbbc005_samples's own) are embedded into
+    image_id below in the `_F{blur}_s##_w{stain}` form manager_agent._parse_bbbc005_metadata's
+    regex expects -- previously image_id carried none of that, so the CountGD ExpertReasoner's
+    dossier never actually got BBBC005's acquisition metadata during training despite the
+    module docstring's claim; the regex had nothing to match against."""
     tasks = []
     id_prefix = "bbbc005" if split == "all" else f"bbbc005_{split}"
-    for i, (image, count) in enumerate(load_bbbc005_samples(n, split=split)):
-        image_id = f"{id_prefix}_{i:03d}_C{count}"
+    for i, (image, count) in enumerate(load_bbbc005_samples(n, blur=blur, stain=stain, split=split)):
+        image_id = f"{id_prefix}_{i:03d}_C{count}_F{blur}_s{i:02d}_w{stain}"
         image_path = output_dir / f"{image_id}.png"
         Image.fromarray(image).save(image_path)
         tasks.append({
@@ -294,7 +299,14 @@ def build_cellvit_tasks(
     within the same fold. image_id is prefixed pannuke_cellvit_ (vs. StarDist's pannuke_f...) so
     the two never collide in save_checkpoint's completed_ids even if their diverse-index
     selections happen to overlap. split: see build_stardist_tasks's docstring -- same parameter,
-    same guarantee, applied to CellViT's own index selection."""
+    same guarantee, applied to CellViT's own index selection.
+
+    n <= 0 returns no tasks without touching manager.stardist_worker at all -- same guard as
+    build_stardist_tasks, for the same reason: select_diverse_indices returns [] for n=0, and
+    indexing that empty list's last element (selected[-1] in
+    _stardist_worker_load_pannuke_diverse_with_classes) raises IndexError without this guard."""
+    if n <= 0:
+        return []
     indices, images, class_counts_list, class_labels_list, tissues = manager.stardist_worker.load_pannuke_diverse_with_classes(
         fold, n, seed=seed, split=split
     )
