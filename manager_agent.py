@@ -1593,8 +1593,12 @@ def run_cellvit_with_feedback(
             counts_by_type, dialogue, str(saved_path), history,
         )
         accept = decision["accept"]
-        revised_classes = decision.get("revised_target_classes")
-        revised_threshold = decision.get("revised_prob_threshold")
+        # sanitize/clamp: Qwen has no API-enforced schema for decide_cellvit_from_dialogue's
+        # response either, so a hallucinated class name or an out-of-[0,1] threshold would
+        # otherwise get applied as-is and silently zero out matches for the rest of the run --
+        # see agentic_cellvit.sanitize_target_classes/clamp_prob_threshold's own docstrings.
+        revised_classes = cellvit_module.sanitize_target_classes(decision.get("revised_target_classes"), target_classes)
+        revised_threshold = cellvit_module.clamp_prob_threshold(decision.get("revised_prob_threshold"))
         feedback = decision["feedback"]
 
         internal_mpq = internal_f1 = per_class_scores = None

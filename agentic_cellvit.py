@@ -131,7 +131,13 @@ def load_cellvit_module(cellvit_repo: Optional[str]):
             COLOR_DICT,
         )
     except ImportError as exc:
-        raise SystemExit(
+        # A normal exception, not SystemExit -- this is a reusable library function called from
+        # manager_agent.py's CellvitClient (and transitively train_manager.py/evaluate_manager.py/
+        # resolve_escalations.py), not just this file's own CLI main(). SystemExit extends
+        # BaseException rather than Exception, so it would silently escape any `except Exception`
+        # handling a caller reasonably adds around a per-image trial to skip a bad image and keep
+        # going -- main() below still exits non-zero either way since nothing here catches it.
+        raise RuntimeError(
             "Could not import CellViT. Clone https://github.com/TIO-IKIM/CellViT and pass "
             "--cellvit-repo /path/to/CellViT (or put it on PYTHONPATH)."
         ) from exc
@@ -163,11 +169,13 @@ def autocast_device_type(inferer) -> str:
 
 def run_cellvit(inferer, image_path: str, magnification: float, target_classes: set, prob_threshold: float, color_dict: dict):
     """Run one CellViT forward pass, treating the whole image as a single 1024x1024 patch.
-    Returns (annotated, matched, counts_by_type, cells) -- matched/counts_by_type are filtered
-    by target_classes/prob_threshold (what the user asked for), while cells is every detected
-    nucleus regardless of that filter (contour in load_patch's 1024x1024 letterboxed-patch
-    coordinate space, type_name, type_prob) -- needed by callers that score the underlying
-    per-class classification quality against ground truth, independent of what was requested."""
+    Returns (annotated, matched, counts_by_type, cells). Only `matched` is filtered by
+    target_classes/prob_threshold (what the user asked for) -- counts_by_type and cells both
+    cover every detected nucleus regardless of that filter (cells additionally carries contour,
+    in load_patch's 1024x1024 letterboxed-patch coordinate space, type_name, type_prob) -- needed
+    by callers that display/score the underlying detections independent of what was requested
+    (e.g. evaluate_result's "all detected cells by type", or scoring per-class classification
+    quality against ground truth)."""
     image = load_patch(image_path)
     patch = inferer.inference_transforms(image).unsqueeze(0).to(inferer.device)
 
@@ -282,6 +290,40 @@ def interpret_request(qwen: AsksJSON, user_prompt: str, image_path: str) -> dict
     return result
 
 
+def sanitize_target_classes(candidate_classes: Optional[list], current_classes: set) -> Optional[set]:
+    """Validate a proposed revised_target_classes (from evaluate_result) against the fixed
+    NUCLEI_CLASSES taxonomy -- the same check interpret_request already applies to Qwen's initial
+    class selection, but evaluate_result's revision previously had no equivalent guard. Without
+    this, a hallucinated/misspelled class name (Qwen has no API-enforced schema) silently
+    corrupted target_classes: c["type_name"] in run_cellvit can never equal an invalid name, so
+    the match filter would permanently return zero matches for the rest of the run with no error
+    raised. Returns None (meaning "no revision, keep the current classes") if candidate_classes is
+    empty/absent or contains any invalid name, printing a warning in the latter case so a bad
+    Qwen response is visible instead of silently swallowed."""
+    if not candidate_classes:
+        return None
+    invalid = [c for c in candidate_classes if c not in NUCLEI_CLASSES]
+    if invalid:
+        print(f"  [warning] ignoring revised_target_classes with invalid class name(s) {invalid} "
+              f"(must be one of {NUCLEI_CLASSES}) -- keeping {sorted(current_classes)}")
+        return None
+    return set(candidate_classes)
+
+
+def clamp_prob_threshold(candidate_threshold: Optional[float]) -> Optional[float]:
+    """Clamp a proposed revised_prob_threshold (from evaluate_result) into [0, 1]. Without this,
+    an out-of-range value (e.g. > 1, since Qwen has no API-enforced schema) makes run_cellvit's
+    `type_prob >= prob_threshold` filter impossible to satisfy ever again (type_prob is a softmax
+    probability, always <= 1) -- silently zeroing predicted_count for the rest of the run with no
+    error raised. A negative value has the opposite effect, matching every detection trivially."""
+    if candidate_threshold is None:
+        return None
+    clamped = min(max(candidate_threshold, 0.0), 1.0)
+    if clamped != candidate_threshold:
+        print(f"  [warning] revised_prob_threshold {candidate_threshold} outside [0, 1] -- clamped to {clamped}")
+    return clamped
+
+
 def evaluate_result(
     qwen: AsksJSON,
     user_prompt: str,
@@ -313,10 +355,21 @@ def evaluate_result(
         "\"score\": int, \"feedback\": str (1-2 sentences), "
         "\"revised_target_classes\": array or null, \"revised_prob_threshold\": number or null}"
     )
-    return qwen.ask_json(
+    result = qwen.ask_json(
         annotated_image_path, prompt, max_new_tokens=768,
         required_keys=["accept", "score", "feedback"],
     )
+    # ask_json's required_keys only checks presence, not type -- Qwen has no API-enforced JSON
+    # schema (see QwenVLM.ask_json's own docstring), so a stray string like "accept": "false" is
+    # plausible free-text drift. Left unchecked, that string is truthy in Python and would get
+    # treated as acceptance of a result Qwen actually meant to reject; a non-numeric "score" would
+    # instead raise a bare TypeError much later, inside loops_to_acceptance's ">=" comparison,
+    # crashing PDF generation after all the expensive CellViT/Qwen work for the run already ran.
+    if not isinstance(result["accept"], bool):
+        raise ValueError(f"Qwen's 'accept' field was not a JSON boolean: {result!r}")
+    if not isinstance(result["score"], (int, float)) or isinstance(result["score"], bool):
+        raise ValueError(f"Qwen's 'score' field was not a JSON number: {result!r}")
+    return result
 
 
 ACCEPT_SCORE_THRESHOLD = 7
@@ -506,12 +559,12 @@ def main():
             "feedback": eval_result["feedback"],
         })
 
-        revised_classes = eval_result.get("revised_target_classes")
-        revised_threshold = eval_result.get("revised_prob_threshold")
-        if eval_result["accept"] or (not revised_classes and revised_threshold is None):
+        revised_classes = sanitize_target_classes(eval_result.get("revised_target_classes"), target_classes)
+        revised_threshold = clamp_prob_threshold(eval_result.get("revised_prob_threshold"))
+        if eval_result["accept"] or (revised_classes is None and revised_threshold is None):
             break
-        if revised_classes:
-            target_classes = set(revised_classes)
+        if revised_classes is not None:
+            target_classes = revised_classes
         if revised_threshold is not None:
             prob_threshold = revised_threshold
 
