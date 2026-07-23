@@ -428,7 +428,7 @@ def main():
     parser.add_argument("--gpu", type=int, default=0, help="CUDA GPU id for inference")
     parser.add_argument("--magnification", type=float, default=40, help="Network magnification")
     parser.add_argument("--enforce-amp", action="store_true", help="Force mixed-precision inference")
-    parser.add_argument("--max-iterations", type=int, default=3)
+    parser.add_argument("--max-iterations", type=int, default=5)
     parser.add_argument("--output-dir", default="./cellvit_agent_output")
     parser.add_argument("--pdf-name", default=PDF_NAME, help="Filename for the saved PDF report")
     parser.add_argument("--model-id", default=MODEL_ID, help="Hugging Face repo id for the Qwen manager")

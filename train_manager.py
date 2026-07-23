@@ -89,22 +89,24 @@ def build_note(qwen, agent: str, image_id: str, history: list, final_image_path,
 
 
 def run_countgd_trial(manager: ManagerAgent, image_path: str, image_id: str, ground_truth_count: int,
-                       max_iterations: int, output_dir: Path, expert_notes: str = "") -> dict:
+                       max_iterations: int, output_dir: Path, expert_notes: str = "",
+                       escalate: bool = True) -> dict:
     result = run_countgd_with_feedback(
         manager.qwen, manager.countgd_client, image_path, "count the individual cells",
         max_iterations, output_dir, ground_truth_count=ground_truth_count, image_id=image_id,
-        expert_notes=expert_notes,
+        expert_notes=expert_notes, escalate=escalate,
     )
     return build_note(manager.qwen, "countgd", image_id, result["history"], result["annotated_image"],
                        lower_is_better=True, chosen_iteration=result["chosen_iteration"])
 
 
 def run_stardist_trial(manager: ManagerAgent, image_path: str, image_id: str, ground_truth_labels,
-                        max_iterations: int, output_dir: Path, expert_notes: str = "") -> dict:
+                        max_iterations: int, output_dir: Path, expert_notes: str = "",
+                        escalate: bool = True) -> dict:
     result = run_stardist_with_feedback(
         manager.qwen, manager.stardist_worker, image_path, "segment the individual nuclei",
         max_iterations, output_dir, ground_truth_labels=ground_truth_labels, image_id=image_id,
-        expert_notes=expert_notes,
+        expert_notes=expert_notes, escalate=escalate,
     )
     return build_note(manager.qwen, "stardist", image_id, result["history"], result["outlines_image"],
                        lower_is_better=False, chosen_iteration=result["chosen_iteration"])
@@ -112,12 +114,12 @@ def run_stardist_trial(manager: ManagerAgent, image_path: str, image_id: str, gr
 
 def run_cellvit_trial(manager: ManagerAgent, image_path: str, image_id: str, ground_truth_counts_by_type: dict,
                        ground_truth_class_labels: dict, max_iterations: int, output_dir: Path,
-                       expert_notes: str = "") -> dict:
+                       expert_notes: str = "", escalate: bool = True) -> dict:
     result = run_cellvit_with_feedback(
         manager.qwen, manager.cellvit_client, image_path, "classify the individual nuclei by cell type",
         max_iterations, output_dir, ground_truth_counts_by_type=ground_truth_counts_by_type,
         ground_truth_class_labels=ground_truth_class_labels, stardist_worker=manager.stardist_worker,
-        image_id=image_id, expert_notes=expert_notes,
+        image_id=image_id, expert_notes=expert_notes, escalate=escalate,
     )
     return build_note(manager.qwen, "cellvit", image_id, result["history"], result["annotated_image"],
                        lower_is_better=False, chosen_iteration=result["chosen_iteration"])
@@ -249,20 +251,30 @@ def build_countgd_tasks(n: int, output_dir: Path, split: str = "all") -> list:
     return tasks
 
 
-def build_stardist_tasks(manager: ManagerAgent, n: int, fold: int, output_dir: Path, seed: int = 0) -> list:
+def build_stardist_tasks(
+    manager: ManagerAgent, n: int, fold: int, output_dir: Path, seed: int = 0, split: str = "all",
+) -> list:
     """Uses StardistWorker.load_pannuke_diverse -- indices spread across as many PanNuke tissue
     types as possible, fetched in one batched read -- instead of the first n images (a single
     contiguous tissue block) via n separate from-scratch reads.
 
     n <= 0 (a CountGD-only run, e.g. --stardist-n 0) returns no tasks without touching
     manager.stardist_worker at all -- select_diverse_indices returns [] for n=0, and indexing
-    that empty list's last element is what used to raise IndexError here before this guard."""
+    that empty list's last element is what used to raise IndexError here before this guard.
+
+    split ("all"/"train"/"test") is select_diverse_indices's own train/test partition (see its
+    docstring in agentic_stardist.py) -- same idea as bbbc005.load_bbbc005_samples's split
+    parameter for CountGD, guaranteeing train/test never share a PanNuke image regardless of n
+    on either side."""
     if n <= 0:
         return []
-    indices, images, gt_labels_list, tissues = manager.stardist_worker.load_pannuke_diverse(fold, n, seed=seed)
+    indices, images, gt_labels_list, tissues = manager.stardist_worker.load_pannuke_diverse(
+        fold, n, seed=seed, split=split
+    )
+    id_prefix = f"pannuke_f{fold}" if split == "all" else f"pannuke_f{fold}_{split}"
     tasks = []
     for idx, image, ground_truth_labels, tissue in zip(indices, images, gt_labels_list, tissues):
-        image_id = f"pannuke_f{fold}_{idx:04d}_{tissue}"
+        image_id = f"{id_prefix}_{idx:04d}_{tissue}"
         image_path = output_dir / f"{image_id}.png"
         Image.fromarray(image).save(image_path)
         tasks.append({
@@ -272,22 +284,26 @@ def build_stardist_tasks(manager: ManagerAgent, n: int, fold: int, output_dir: P
     return tasks
 
 
-def build_cellvit_tasks(manager: ManagerAgent, n: int, fold: int, output_dir: Path, seed: int = 1) -> list:
+def build_cellvit_tasks(
+    manager: ManagerAgent, n: int, fold: int, output_dir: Path, seed: int = 1, split: str = "all",
+) -> list:
     """CellViT counterpart to build_stardist_tasks -- same diverse-tissue index selection via
     StardistWorker (load_pannuke_diverse_with_classes), but per-class ground truth instead of one
     class-agnostic instance mask. Default seed differs from build_stardist_tasks's (0) so a
     combined run doesn't just train CellViT on the exact same images StarDist already trained on
     within the same fold. image_id is prefixed pannuke_cellvit_ (vs. StarDist's pannuke_f...) so
     the two never collide in save_checkpoint's completed_ids even if their diverse-index
-    selections happen to overlap."""
+    selections happen to overlap. split: see build_stardist_tasks's docstring -- same parameter,
+    same guarantee, applied to CellViT's own index selection."""
     indices, images, class_counts_list, class_labels_list, tissues = manager.stardist_worker.load_pannuke_diverse_with_classes(
-        fold, n, seed=seed
+        fold, n, seed=seed, split=split
     )
+    id_prefix = f"pannuke_cellvit_f{fold}" if split == "all" else f"pannuke_cellvit_f{fold}_{split}"
     tasks = []
     for idx, image, ground_truth_counts_by_type, ground_truth_class_labels, tissue in zip(
         indices, images, class_counts_list, class_labels_list, tissues
     ):
-        image_id = f"pannuke_cellvit_f{fold}_{idx:04d}_{tissue}"
+        image_id = f"{id_prefix}_{idx:04d}_{tissue}"
         image_path = output_dir / f"{image_id}.png"
         Image.fromarray(image).save(image_path)
         tasks.append({
@@ -334,6 +350,15 @@ def main():
                          help="BBBC005 has no official folds; 'train'/'test' partition by count-sorted "
                               "index parity so the two never share an image regardless of --countgd-n "
                               "on either side. Use 'train' for training runs and 'test' for held-out eval.")
+    parser.add_argument("--pannuke-split", default="all", choices=["all", "train", "test"],
+                         help="Same idea as --bbbc005-split, applied to StarDist/CellViT's PanNuke "
+                              "diverse-index selection within a fold (see select_diverse_indices) -- "
+                              "'train'/'test' partition by index parity so the two never share an image "
+                              "regardless of --stardist-n/--cellvit-n on either side. NOTE: this only "
+                              "controls which images get selected -- running this script again on the "
+                              "'test' split still trains on it (updates running_prompt/expert_notes); "
+                              "for a real held-out evaluation that doesn't do that, use "
+                              "evaluate_manager.py instead.")
     parser.add_argument("--max-iterations", type=int, default=5, help="Retry budget per training image")
     parser.add_argument("--batch-size", type=int, default=5, help="Images per aggregation round")
     parser.add_argument("--output-dir", default="./train_manager_output")
@@ -342,8 +367,9 @@ def main():
         "--resume-from", default=None,
         help="Path to a checkpoint.json (written every batch) to continue from -- already-"
              "completed image_ids are skipped and their notes/running_prompt are reloaded. "
-             "--countgd-n/--stardist-n/--cellvit-n/--pannuke-fold should match (or exceed) the "
-             "run that produced the checkpoint so the same/superset image set is built.",
+             "--countgd-n/--stardist-n/--cellvit-n/--pannuke-fold/--pannuke-split/--bbbc005-split "
+             "should match (or exceed) the run that produced the checkpoint so the same/superset "
+             "image set is built.",
     )
     args = parser.parse_args()
     if args.max_iterations < 1:
@@ -361,8 +387,9 @@ def main():
     )
     tasks = interleave_tasks(
         build_countgd_tasks(args.countgd_n, output_dir, split=args.bbbc005_split),
-        build_stardist_tasks(manager, args.stardist_n, args.pannuke_fold, output_dir),
-        build_cellvit_tasks(manager, args.cellvit_n, args.pannuke_fold, output_dir) if args.cellvit_n > 0 else [],
+        build_stardist_tasks(manager, args.stardist_n, args.pannuke_fold, output_dir, split=args.pannuke_split),
+        build_cellvit_tasks(manager, args.cellvit_n, args.pannuke_fold, output_dir, split=args.pannuke_split)
+        if args.cellvit_n > 0 else [],
     )
     if not tasks:
         parser.error("at least one of --countgd-n / --stardist-n / --cellvit-n must be > 0")

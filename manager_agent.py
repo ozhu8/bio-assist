@@ -891,7 +891,7 @@ def choose_best_output(qwen: QwenVLM, task_description: str, candidates: list) -
 def run_countgd_with_feedback(
     qwen: QwenVLM, countgd_client: Client, image_path: str, task_description: str,
     max_iterations: int, output_dir: Path, ground_truth_count: int | None = None,
-    image_id: str | None = None, expert_notes: str = "",
+    image_id: str | None = None, expert_notes: str = "", escalate: bool = True,
 ) -> dict:
     """The manager always consults a private ExpertReasoner (never shown ground truth itself --
     see module docstring) via a multi-turn dialogue (run_expert_dialogue) and decides
@@ -903,10 +903,13 @@ def run_countgd_with_feedback(
     for history/logging only when real ground truth exists (internal_mae/internal_would_accept
     -- see module docstring), never used for the decision either way. If the loop never reaches
     accept=True, the case is queued for human review (write_escalation) instead of silently
-    shipping the last attempt -- requires image_id. expert_notes (see _apply_expert_notes) are
-    accumulated guidance from previously human-resolved escalations this run, folded into the
-    dossier so the expert's own reasoning stays consistent across images too, not just the
-    manager's running_prompt."""
+    shipping the last attempt -- requires image_id. escalate=False suppresses that queuing
+    entirely regardless of image_id -- used by evaluate_manager.py so a held-out test image that
+    never gets accepted doesn't end up in the escalation_queue a human might later resolve,
+    which would otherwise let test-set corrections leak back into expert_notes/running_prompt
+    through that back door. expert_notes (see _apply_expert_notes) are accumulated guidance from
+    previously human-resolved escalations this run, folded into the dossier so the expert's own
+    reasoning stays consistent across images too, not just the manager's running_prompt."""
     count_target = interpret_countgd_target(qwen, task_description, image_path)
     print(f"[Qwen] counting target: {count_target!r}")
 
@@ -986,7 +989,7 @@ def run_countgd_with_feedback(
     # attempt the manager actually chose above, not whichever ran last -- those differ
     # whenever choose_best_output reverted to an earlier iteration.
     chosen_entry = next(h for h in history if h["iteration"] == chosen_iteration)
-    if not chosen_entry["accept"] and image_id is not None:
+    if not chosen_entry["accept"] and image_id is not None and escalate:
         assert saved_path is not None, "saved_path must not be None if history has entries"
         write_escalation(
             output_dir, image_id, "countgd", task_description, image_path, saved_path, history,
@@ -1043,14 +1046,16 @@ def _stardist_worker_load_pannuke_with_classes(fold: int, index: int):
     return load_pannuke_sample_with_classes(fold, index)
 
 
-def _stardist_worker_load_pannuke_diverse(fold: int, n: int, seed: int = 0):
+def _stardist_worker_load_pannuke_diverse(fold: int, n: int, seed: int = 0, split: str = "all"):
     """Runs inside the spawned subprocess. Picks n indices spread across as many distinct
     PanNuke tissue types as possible (agentic_stardist.select_diverse_indices) instead of the
     first n (a single contiguous tissue block), then fetches all of them in one batched
-    load_pannuke_samples call rather than n separate from-scratch reads."""
+    load_pannuke_samples call rather than n separate from-scratch reads. split ("all"/"train"/
+    "test") is select_diverse_indices's own train/test partition -- see its docstring; same idea
+    as bbbc005.load_bbbc005_samples's split parameter for CountGD."""
     from agentic_stardist import TISSUE_DIVERSITY_MAX_INDEX, load_pannuke_samples, load_pannuke_types, select_diverse_indices
     all_types = load_pannuke_types(fold)
-    selected = select_diverse_indices(all_types, n, max_index=TISSUE_DIVERSITY_MAX_INDEX, seed=seed)
+    selected = select_diverse_indices(all_types, n, max_index=TISSUE_DIVERSITY_MAX_INDEX, seed=seed, split=split)
     images_prefix, gt_labels_prefix, tissue_prefix = load_pannuke_samples(fold, selected[-1] + 1)
     return (
         selected,
@@ -1060,16 +1065,18 @@ def _stardist_worker_load_pannuke_diverse(fold: int, n: int, seed: int = 0):
     )
 
 
-def _stardist_worker_load_pannuke_diverse_with_classes(fold: int, n: int, seed: int = 0):
+def _stardist_worker_load_pannuke_diverse_with_classes(fold: int, n: int, seed: int = 0, split: str = "all"):
     """Runs inside the spawned subprocess. CellViT counterpart to
     _stardist_worker_load_pannuke_diverse: same diverse-tissue index selection, but returns
     per-class ground truth (agentic_stardist.load_pannuke_samples_with_classes) instead of one
-    class-agnostic instance mask, since CellViT scores per pathology type."""
+    class-agnostic instance mask, since CellViT scores per pathology type. split ("all"/"train"/
+    "test") is select_diverse_indices's own train/test partition -- see its docstring; same idea
+    as bbbc005.load_bbbc005_samples's split parameter for CountGD."""
     from agentic_stardist import (
         TISSUE_DIVERSITY_MAX_INDEX, load_pannuke_samples_with_classes, load_pannuke_types, select_diverse_indices,
     )
     all_types = load_pannuke_types(fold)
-    selected = select_diverse_indices(all_types, n, max_index=TISSUE_DIVERSITY_MAX_INDEX, seed=seed)
+    selected = select_diverse_indices(all_types, n, max_index=TISSUE_DIVERSITY_MAX_INDEX, seed=seed, split=split)
     images_prefix, class_counts_prefix, class_labels_prefix, tissue_prefix = load_pannuke_samples_with_classes(
         fold, selected[-1] + 1
     )
@@ -1178,11 +1185,13 @@ class StardistWorker:
     def load_pannuke_sample_with_classes(self, fold: int, index: int):
         return self._pool.submit(_stardist_worker_load_pannuke_with_classes, fold, index).result()
 
-    def load_pannuke_diverse(self, fold: int, n: int, seed: int = 0):
-        return self._pool.submit(_stardist_worker_load_pannuke_diverse, fold, n, seed).result()
+    def load_pannuke_diverse(self, fold: int, n: int, seed: int = 0, split: str = "all"):
+        return self._pool.submit(_stardist_worker_load_pannuke_diverse, fold, n, seed, split).result()
 
-    def load_pannuke_diverse_with_classes(self, fold: int, n: int, seed: int = 0):
-        return self._pool.submit(_stardist_worker_load_pannuke_diverse_with_classes, fold, n, seed).result()
+    def load_pannuke_diverse_with_classes(self, fold: int, n: int, seed: int = 0, split: str = "all"):
+        return self._pool.submit(
+            _stardist_worker_load_pannuke_diverse_with_classes, fold, n, seed, split
+        ).result()
 
     def score_cellvit_predictions(self, predicted_cells: list, gt_class_instance_labels: dict, image_shape: tuple):
         return self._pool.submit(
@@ -1323,7 +1332,7 @@ def write_escalation(
 def run_stardist_with_feedback(
     qwen: QwenVLM, worker: StardistWorker, image_path: str, task_description: str,
     max_iterations: int, output_dir: Path, ground_truth_labels: np.ndarray | None = None, tissue: str | None = None,
-    image_id: str | None = None, expert_notes: str = "",
+    image_id: str | None = None, expert_notes: str = "", escalate: bool = True,
 ) -> dict:
     """The manager always consults a private ExpertReasoner (never shown ground truth itself --
     see module docstring) via a multi-turn dialogue (run_expert_dialogue) and decides
@@ -1337,9 +1346,11 @@ def run_stardist_with_feedback(
     (internal_pq/internal_would_accept -- see module docstring), never used for the decision
     either way. If the loop never reaches accept=True, the case is queued for human review
     (write_escalation) instead of silently shipping whatever the last/best attempt was --
-    requires image_id. expert_notes (see _apply_expert_notes) are accumulated guidance from
-    previously human-resolved escalations this run, folded into the dossier so the expert's own
-    reasoning stays consistent across images too, not just the manager's running_prompt."""
+    requires image_id. escalate=False suppresses that queuing regardless of image_id (see
+    run_countgd_with_feedback's docstring for why -- used by evaluate_manager.py). expert_notes
+    (see _apply_expert_notes) are accumulated guidance from previously human-resolved
+    escalations this run, folded into the dossier so the expert's own reasoning stays consistent
+    across images too, not just the manager's running_prompt."""
     image, prob_thresh, nms_thresh = worker.init(image_path)
 
     gt_outlines_path = output_dir / "stardist_ground_truth.png"
@@ -1470,7 +1481,7 @@ def run_stardist_with_feedback(
     # manager actually chose (chosen_iteration), not whichever ran last -- those differ
     # whenever choose_best_output reverted to an earlier iteration.
     chosen_entry = next(h for h in history if h["iteration"] == chosen_iteration)
-    if not chosen_entry["accept"] and image_id is not None:
+    if not chosen_entry["accept"] and image_id is not None and escalate:
         assert saved_path is not None, "saved_path must not be None when writing escalation"
         write_escalation(
             output_dir, image_id, "stardist", task_description, image_path, saved_path, history,
@@ -1487,7 +1498,7 @@ def run_cellvit_with_feedback(
     max_iterations: int, output_dir: Path,
     ground_truth_counts_by_type: dict | None = None, ground_truth_class_labels: dict | None = None,
     stardist_worker: StardistWorker | None = None, tissue: str | None = None, image_id: str | None = None,
-    expert_notes: str = "",
+    expert_notes: str = "", escalate: bool = True,
 ) -> dict:
     """The manager always consults a private ExpertReasoner (never shown ground truth itself --
     see module docstring) via a multi-turn dialogue (run_expert_dialogue) and decides
@@ -1501,10 +1512,11 @@ def run_cellvit_with_feedback(
     -- when ground_truth_class_labels (the raw per-class instance-label arrays needed to actually
     score against, not just count) and stardist_worker are also given. If the loop never reaches
     accept=True, the case is queued for human review (write_escalation) instead of silently
-    shipping whatever the last/best attempt was -- requires image_id. expert_notes (see
-    _apply_expert_notes) are accumulated guidance from previously human-resolved escalations this
-    run, folded into the dossier so the expert's own reasoning stays consistent across images
-    too, not just the manager's running_prompt.
+    shipping whatever the last/best attempt was -- requires image_id. escalate=False suppresses
+    that queuing regardless of image_id (see run_countgd_with_feedback's docstring for why --
+    used by evaluate_manager.py). expert_notes (see _apply_expert_notes) are accumulated guidance
+    from previously human-resolved escalations this run, folded into the dossier so the expert's
+    own reasoning stays consistent across images too, not just the manager's running_prompt.
 
     Unlike StarDist/CountGD, scoring against ground truth needs a subprocess round-trip
     (StardistWorker.score_cellvit_predictions) even though CellViT itself runs in-process here --
@@ -1607,7 +1619,7 @@ def run_cellvit_with_feedback(
         saved_path = iteration_outputs[chosen_iteration]["path"]
 
     chosen_entry = next(h for h in history if h["iteration"] == chosen_iteration)
-    if not chosen_entry["accept"] and image_id is not None:
+    if not chosen_entry["accept"] and image_id is not None and escalate:
         assert saved_path is not None, "saved_path must not be None when writing escalation"
         write_escalation(
             output_dir, image_id, "cellvit", task_description, image_path, saved_path, history,
@@ -1627,7 +1639,7 @@ def run_deepgleason_with_feedback(
     qwen: QwenVLM, deepgleason_client: DeepGleasonClient, slide_path: str, task_description: str,
     max_iterations: int, output_dir: Path,
     ground_truth_gleason_score: str | None = None, ground_truth_isup_grade: int | None = None,
-    image_id: str | None = None, expert_notes: str = "",
+    image_id: str | None = None, expert_notes: str = "", escalate: bool = True,
 ) -> dict:
     """The manager always consults a private ExpertReasoner (never shown ground truth itself --
     see module docstring) via a multi-turn dialogue (run_expert_dialogue) and decides
@@ -1649,7 +1661,8 @@ def run_deepgleason_with_feedback(
     internal_mae/internal_pq elsewhere). "No tumor found" is treated as ISUP grade 0 for this
     purpose -- an ordinal extension, since no tumor is less severe than any graded one. If the
     loop never reaches accept=True, the case is queued for human review (write_escalation) --
-    requires image_id."""
+    requires image_id. escalate=False suppresses that queuing regardless of image_id (see
+    run_countgd_with_feedback's docstring for why -- used by evaluate_manager.py)."""
     deepgleason_client.run_slide(slide_path, output_dir)
     preview_path = deepgleason_client.preview_path
     confidence_threshold = DEEPGLEASON_INITIAL_CONFIDENCE_THRESHOLD
@@ -1705,7 +1718,7 @@ def run_deepgleason_with_feedback(
     # worse) visual outputs to compare. Here every iteration re-aggregates the exact same cached
     # predictions CSV against the exact same overlay image -- only the numeric gleason_result
     # changes, not anything to visually compare -- so the last iteration's result is simply used.
-    if not history[-1]["accept"] and image_id is not None:
+    if not history[-1]["accept"] and image_id is not None and escalate:
         ground_truth = None
         if ground_truth_gleason_score is not None or ground_truth_isup_grade is not None:
             ground_truth = {"gleason_score": ground_truth_gleason_score, "isup_grade": ground_truth_isup_grade}
@@ -1779,7 +1792,7 @@ class ManagerAgent:
         ground_truth_counts_by_type: dict | None = None, ground_truth_class_labels: dict | None = None,
         ground_truth_gleason_score: str | None = None, ground_truth_isup_grade: int | None = None,
         tissue: str | None = None, image_id: str | None = None, slide_path: str | None = None,
-        expert_notes: str = "",
+        expert_notes: str = "", escalate: bool = True,
     ) -> dict:
         """ground_truth_count (CountGD), ground_truth_labels (StarDist),
         ground_truth_counts_by_type/ground_truth_class_labels (CellViT), and
@@ -1796,7 +1809,9 @@ class ManagerAgent:
         train_manager.py. expert_notes (see _apply_expert_notes) are accumulated guidance from
         previously human-resolved escalations, typically loaded from checkpoint.json by a caller
         like train_manager.py or resolve_escalations.py -- empty by default (a live one-off CLI
-        call with no checkpoint to load from).
+        call with no checkpoint to load from). escalate=False suppresses escalation entirely
+        regardless of image_id -- used by evaluate_manager.py so held-out test results never
+        enter the escalation_queue (see run_countgd_with_feedback's docstring for why).
 
         slide_path is DeepGleason-specific: image_path itself must always be something Qwen's
         vision-language model can actually load for routing/select_agent (a normal-sized image),
@@ -1816,6 +1831,7 @@ class ManagerAgent:
             return run_countgd_with_feedback(
                 self.qwen, self.countgd_client, image_path, task_description, max_iterations, out_dir,
                 ground_truth_count=ground_truth_count, image_id=image_id, expert_notes=expert_notes,
+                escalate=escalate,
             )
         if agent == "cellvit":
             return run_cellvit_with_feedback(
@@ -1823,17 +1839,19 @@ class ManagerAgent:
                 ground_truth_counts_by_type=ground_truth_counts_by_type,
                 ground_truth_class_labels=ground_truth_class_labels,
                 stardist_worker=self.stardist_worker if ground_truth_class_labels is not None else None,
-                tissue=tissue, image_id=image_id, expert_notes=expert_notes,
+                tissue=tissue, image_id=image_id, expert_notes=expert_notes, escalate=escalate,
             )
         if agent == "deepgleason":
             return run_deepgleason_with_feedback(
                 self.qwen, self.deepgleason_client, slide_path or image_path, task_description, max_iterations,
                 out_dir, ground_truth_gleason_score=ground_truth_gleason_score,
                 ground_truth_isup_grade=ground_truth_isup_grade, image_id=image_id, expert_notes=expert_notes,
+                escalate=escalate,
             )
         return run_stardist_with_feedback(
             self.qwen, self.stardist_worker, image_path, task_description, max_iterations, out_dir,
             ground_truth_labels=ground_truth_labels, tissue=tissue, image_id=image_id, expert_notes=expert_notes,
+            escalate=escalate,
         )
 
 

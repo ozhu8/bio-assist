@@ -226,7 +226,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run CountGD with Claude as orchestrator/evaluator")
     parser.add_argument("--image", required=True, help="Path to the input image")
     parser.add_argument("--prompt", required=True, help="What to count / user instruction")
-    parser.add_argument("--max-iterations", type=int, default=3)
+    parser.add_argument("--max-iterations", type=int, default=5)
     parser.add_argument("--output-dir", default="./countgd_agent_output")
     parser.add_argument("--pdf-name", default=PDF_NAME, help="Filename for the saved PDF report")
     args = parser.parse_args()

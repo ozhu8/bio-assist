@@ -210,17 +210,35 @@ def load_pannuke_types(fold: int) -> list:
     return [str(t) for t in types]
 
 
-def select_diverse_indices(types: list, n: int, max_index: int | None = None, seed: int = 0) -> list:
+def select_diverse_indices(
+    types: list, n: int, max_index: int | None = None, seed: int = 0, split: str = "all",
+) -> list:
     """Pick n indices spanning as many distinct tissue types as possible instead of the
     first n (which in PanNuke is a single contiguous tissue block). max_index bounds how
     deep into the fold to look (see TISSUE_DIVERSITY_MAX_INDEX) -- a tissue whose earliest
     occurrence falls beyond it is simply unavailable to this sample. Round-robins through
     tissues in shuffled order (seeded for reproducibility), taking one index per tissue per
     pass, so the result isn't dominated by whichever tissue has the biggest block. Returns
-    indices sorted ascending (the order they'll need to be read from the fold in anyway)."""
+    indices sorted ascending (the order they'll need to be read from the fold in anyway).
+
+    split: "all" (default, original behavior), "train", or "test" -- same idea as
+    bbbc005.load_bbbc005_samples's split parameter: partitions the candidate index pool by
+    parity (even -> train, odd -> test) before the diverse-tissue selection runs, so train/test
+    never share an image regardless of n on either side, while both halves still see the same
+    tissue-type diversity (PanNuke stores contiguous per-tissue blocks, so alternating parity
+    within a block -- not splitting low-half/high-half -- keeps both halves representative of
+    each tissue rather than one half seeing only that tissue's first occurrences)."""
     by_tissue = {}
     limit = len(types) if max_index is None else min(max_index + 1, len(types))
-    for i in range(limit):
+    if split == "train":
+        candidate_indices = range(0, limit, 2)
+    elif split == "test":
+        candidate_indices = range(1, limit, 2)
+    elif split == "all":
+        candidate_indices = range(limit)
+    else:
+        raise ValueError(f"split must be 'all', 'train', or 'test', got {split!r}")
+    for i in candidate_indices:
         by_tissue.setdefault(types[i], []).append(i)
 
     tissue_order = list(by_tissue.keys())

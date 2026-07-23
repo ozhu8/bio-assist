@@ -231,3 +231,23 @@ stay isolated.
 - No API key is required to run `manager_agent.py` -- Qwen runs locally, CountGD is
   a public hosted Gradio Space. The `anthropic` package is still a required import
   (transitively, via `agentic_countgd.py`/`agentic_stardist.py`) but is never called.
+- Train/test splitting (2026-07-22): `agentic_stardist.select_diverse_indices` gained a `split`
+  parameter ("all"/"train"/"test", same idea as `bbbc005.load_bbbc005_samples`'s existing one) --
+  partitions the candidate PanNuke index pool by parity before the diverse-tissue selection runs,
+  so train/test never share an image regardless of `n` on either side. Threaded through
+  `StardistWorker.load_pannuke_diverse`/`load_pannuke_diverse_with_classes` and
+  `train_manager.py`'s `--pannuke-split` CLI flag, covering StarDist and CellViT the same way
+  `--bbbc005-split` already covered CountGD. **Important limitation this doesn't solve on its
+  own**: `train_manager.py` updates `expert_notes` (and, in principle, `running_prompt`) from
+  every image it processes -- running it a second time against `--pannuke-split test` would
+  still train on that "test" data, not evaluate against it cleanly. `evaluate_manager.py` is the
+  actual held-out-evaluation counterpart: it loads a trained checkpoint's `running_prompt`/
+  `expert_notes` as fixed, read-only inputs (never reassigned or written back), reuses
+  `train_manager.py`'s own task-building/trial-running/scoring functions against test-split
+  data, and reports accuracy to a separate `eval_result.json`. It also passes a new
+  `escalate=False` parameter (threaded through all four `run_*_with_feedback` functions and
+  `ManagerAgent.run()`) so a held-out result that never gets accepted can't enter the
+  `escalation_queue` either -- without that, a human later resolving that escalation via
+  `resolve_escalations.py` would leak test-set corrections back into `expert_notes` through that
+  back door, defeating the split. DeepGleason has no dataset integration yet (see above) so
+  isn't part of either script.
