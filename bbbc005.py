@@ -65,7 +65,16 @@ def load_bbbc005_samples(n: int, blur: int = 1, stain: int = 1, split: str = "al
     same indices too), this guarantees train/test never share an image regardless of which n
     each side requests, while both halves still span the full 1-100 count range evenly (since
     consecutive, similarly-scored members alternate between the two halves rather than being
-    split low-half/high-half, which would have made test systematically differ in difficulty)."""
+    split low-half/high-half, which would have made test systematically differ in difficulty).
+
+    n <= 0 returns no samples without opening the remote zip at all -- same guard, and same
+    reasoning, as agentic_stardist.select_diverse_indices's callers in manager_agent.py
+    (StardistWorker.load_pannuke_diverse et al.): np.linspace(..., n) raises ValueError for a
+    negative n, which otherwise surfaced as a raw crash from a caller like train_manager.py's
+    build_countgd_tasks passing through a negative --countgd-n with no earlier, friendlier
+    error."""
+    if n <= 0:
+        return []
     zf = _open_bbbc005_zip()
     try:
         members = sorted(list_bbbc005_members(zf, blur=blur, stain=stain), key=lambda pair: pair[1])

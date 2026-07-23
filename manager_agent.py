@@ -616,6 +616,32 @@ def build_deepgleason_dossier(ground_truth_gleason_score: str | None, ground_tru
     return " ".join(lines)
 
 
+def deepgleason_forbidden_values(gleason_score: str | None, isup_grade: int | None) -> list:
+    """Forbidden values for ExpertReasoner's leak-check when playing EXPERT_PERSONA_DEEPGLEASON.
+
+    isup_grade is deliberately NOT forbidden as a bare digit, unlike every other agent's int
+    ground truth (see build_countgd_dossier/build_stardist_dossier/build_cellvit_dossier's
+    forbidden_values). A bare 1-5 int would match ordinary "Gleason pattern 3/4/5" language --
+    exactly the vocabulary EXPERT_PERSONA_DEEPGLEASON instructs the expert to use when describing
+    a region's morphology -- since Gleason pattern numbers and ISUP grades occupy the same 1-5
+    range. Checking that bare digit made answer() false-positive on completely legitimate,
+    non-leaking reasoning (e.g. "...consistent with Gleason pattern 4 rather than..."), burning
+    retries and collapsing to EXPERT_LEAK_FALLBACK far more than the "occasional" case the
+    leak-check is meant to tolerate. The phrase-level forms below still catch the expert literally
+    stating the verdict ("ISUP grade group 4", "ISUP 4", "grade group 4") without flagging routine
+    per-region pattern descriptions. gleason_score (e.g. "3+4") is specific enough as-is -- kept
+    as a plain forbidden value."""
+    forbidden = []
+    if gleason_score is not None:
+        forbidden.append(gleason_score)
+    if isup_grade is not None:
+        forbidden += [
+            f"ISUP grade group {isup_grade}", f"ISUP grade {isup_grade}",
+            f"ISUP {isup_grade}", f"grade group {isup_grade}",
+        ]
+    return forbidden
+
+
 EXPERT_LEAK_FALLBACK = (
     "I can't get into specifics there -- think about it in terms of the visual/morphological "
     "reasoning rather than any exact number."
@@ -1673,7 +1699,7 @@ def run_deepgleason_with_feedback(
         else NO_GROUND_TRUTH_DOSSIER
     )
     dossier = _apply_expert_notes(dossier, expert_notes)
-    forbidden_values = [v for v in (ground_truth_gleason_score, ground_truth_isup_grade) if v is not None]
+    forbidden_values = deepgleason_forbidden_values(ground_truth_gleason_score, ground_truth_isup_grade)
     expert = ExpertReasoner(qwen, EXPERT_PERSONA_DEEPGLEASON, dossier, forbidden_values=forbidden_values)
 
     history = []
@@ -1826,6 +1852,17 @@ class ManagerAgent:
 
         agent = select_agent(self.qwen, task_description, image_path)
         print(f"[Qwen] routed to: {agent}")
+
+        # Fail fast, with an actionable message, right after routing decides on CellViT --
+        # otherwise this wouldn't surface until deep inside run_cellvit_with_feedback (after an
+        # extra interpret_request Qwen call) via cellvit_client's bare assert, wasting a call for
+        # a misconfiguration that's already fully knowable at this point.
+        if agent == "cellvit" and not self.cellvit_checkpoint:
+            raise RuntimeError(
+                "Task routed to CellViT, but no --cellvit-checkpoint was given. Pass "
+                "--cellvit-checkpoint /path/to/CellViT-*.pth (and --cellvit-repo if "
+                "TIO-IKIM/CellViT isn't already on PYTHONPATH) to handle CellViT-routable tasks."
+            )
 
         if agent == "countgd":
             return run_countgd_with_feedback(

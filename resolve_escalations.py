@@ -35,7 +35,8 @@ import numpy as np  # pyright: ignore[reportMissingImports]
 from manager_agent import (
     EXPERT_PERSONA_CELLVIT, EXPERT_PERSONA_COUNTGD, EXPERT_PERSONA_DEEPGLEASON, EXPERT_PERSONA_STARDIST,
     MODEL_ID, NO_GROUND_TRUTH_DOSSIER, ExpertReasoner, QwenVLM, _apply_expert_notes, build_cellvit_dossier,
-    build_countgd_dossier, build_deepgleason_dossier, build_stardist_dossier, run_human_expert_dialogue,
+    build_countgd_dossier, build_deepgleason_dossier, build_stardist_dossier, deepgleason_forbidden_values,
+    run_human_expert_dialogue,
 )
 from train_manager import merge_escalation_feedback, merge_expert_notes
 
@@ -102,7 +103,7 @@ def resolve_one(qwen: QwenVLM, record_path: Path, record: Dict, checkpoint_path:
         dossier = _apply_expert_notes(dossier, expert_notes)
         expert = ExpertReasoner(
             qwen, EXPERT_PERSONA_DEEPGLEASON, dossier,
-            forbidden_values=[v for v in (gleason_score, isup_grade) if v is not None],
+            forbidden_values=deepgleason_forbidden_values(gleason_score, isup_grade),
         )
     else:
         ground_truth_count = record.get("ground_truth_value")
