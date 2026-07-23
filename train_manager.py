@@ -101,12 +101,12 @@ def run_countgd_trial(manager: ManagerAgent, image_path: str, image_id: str, gro
 
 
 def run_stardist_trial(manager: ManagerAgent, image_path: str, image_id: str, ground_truth_labels,
-                        max_iterations: int, output_dir: Path, expert_notes: str = "",
-                        escalate: bool = True) -> dict:
+                        max_iterations: int, output_dir: Path, tissue: str | None = None,
+                        expert_notes: str = "", escalate: bool = True) -> dict:
     result = run_stardist_with_feedback(
         manager.qwen, manager.stardist_worker, image_path, "segment the individual nuclei",
-        max_iterations, output_dir, ground_truth_labels=ground_truth_labels, image_id=image_id,
-        expert_notes=expert_notes, escalate=escalate,
+        max_iterations, output_dir, ground_truth_labels=ground_truth_labels, tissue=tissue,
+        image_id=image_id, expert_notes=expert_notes, escalate=escalate,
     )
     return build_note(manager.qwen, "stardist", image_id, result["history"], result["outlines_image"],
                        lower_is_better=False, chosen_iteration=result["chosen_iteration"])
@@ -114,12 +114,12 @@ def run_stardist_trial(manager: ManagerAgent, image_path: str, image_id: str, gr
 
 def run_cellvit_trial(manager: ManagerAgent, image_path: str, image_id: str, ground_truth_counts_by_type: dict,
                        ground_truth_class_labels: dict, max_iterations: int, output_dir: Path,
-                       expert_notes: str = "", escalate: bool = True) -> dict:
+                       tissue: str | None = None, expert_notes: str = "", escalate: bool = True) -> dict:
     result = run_cellvit_with_feedback(
         manager.qwen, manager.cellvit_client, image_path, "classify the individual nuclei by cell type",
         max_iterations, output_dir, ground_truth_counts_by_type=ground_truth_counts_by_type,
         ground_truth_class_labels=ground_truth_class_labels, stardist_worker=manager.stardist_worker,
-        image_id=image_id, expert_notes=expert_notes, escalate=escalate,
+        tissue=tissue, image_id=image_id, expert_notes=expert_notes, escalate=escalate,
     )
     return build_note(manager.qwen, "cellvit", image_id, result["history"], result["annotated_image"],
                        lower_is_better=False, chosen_iteration=result["chosen_iteration"])
@@ -279,7 +279,7 @@ def build_stardist_tasks(
         Image.fromarray(image).save(image_path)
         tasks.append({
             "agent": "stardist", "image_id": image_id, "image_path": str(image_path),
-            "ground_truth_labels": ground_truth_labels,
+            "ground_truth_labels": ground_truth_labels, "tissue": tissue,
         })
     return tasks
 
@@ -309,7 +309,7 @@ def build_cellvit_tasks(
         tasks.append({
             "agent": "cellvit", "image_id": image_id, "image_path": str(image_path),
             "ground_truth_counts_by_type": ground_truth_counts_by_type,
-            "ground_truth_class_labels": ground_truth_class_labels,
+            "ground_truth_class_labels": ground_truth_class_labels, "tissue": tissue,
         })
     return tasks
 
@@ -422,12 +422,13 @@ def main():
         elif task["agent"] == "cellvit":
             note = run_cellvit_trial(
                 manager, task["image_path"], task["image_id"], task["ground_truth_counts_by_type"],
-                task["ground_truth_class_labels"], args.max_iterations, output_dir, expert_notes=expert_notes,
+                task["ground_truth_class_labels"], args.max_iterations, output_dir,
+                tissue=task["tissue"], expert_notes=expert_notes,
             )
         else:
             note = run_stardist_trial(
                 manager, task["image_path"], task["image_id"], task["ground_truth_labels"],
-                args.max_iterations, output_dir, expert_notes=expert_notes,
+                args.max_iterations, output_dir, tissue=task["tissue"], expert_notes=expert_notes,
             )
         notes.append(note)
         new_notes.append(note)

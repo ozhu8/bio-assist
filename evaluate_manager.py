@@ -109,12 +109,12 @@ def main():
             note = run_cellvit_trial(
                 manager, task["image_path"], task["image_id"], task["ground_truth_counts_by_type"],
                 task["ground_truth_class_labels"], args.max_iterations, output_dir,
-                expert_notes=expert_notes, escalate=False,
+                tissue=task["tissue"], expert_notes=expert_notes, escalate=False,
             )
         else:
             note = run_stardist_trial(
                 manager, task["image_path"], task["image_id"], task["ground_truth_labels"],
-                args.max_iterations, output_dir, expert_notes=expert_notes, escalate=False,
+                args.max_iterations, output_dir, tissue=task["tissue"], expert_notes=expert_notes, escalate=False,
             )
         notes.append(note)
         print(f"  initial={note['initial_score']}  final={note['final_score']}  accepted={note['accepted']}")
