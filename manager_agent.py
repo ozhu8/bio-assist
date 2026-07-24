@@ -779,7 +779,7 @@ class ExpertReasoner:
     what the model does, at the cost of an occasional false-positive-triggered generic answer
     (e.g. a coincidental digit match unrelated to the ground truth)."""
 
-    def __init__(self, qwen: QwenVLM, persona: str, dossier: str, forbidden_values: list):
+    def __init__(self, qwen: QwenVLM | ClaudeVLM, persona: str, dossier: str, forbidden_values: list):
         self.qwen = qwen
         self.persona = persona
         self.dossier = dossier
