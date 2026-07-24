@@ -76,8 +76,13 @@ def interpret_prompt(claude: anthropic.Anthropic, user_prompt: str, image_path: 
             ],
         }],
     )
-    text = next(b.text for b in response.content if b.type == "text")
-    return text.strip().strip('."\'')
+    text_blocks = [b.text for b in response.content if b.type == "text"]
+    if not text_blocks:
+        raise RuntimeError(
+            f"Claude returned no text content (stop_reason={response.stop_reason!r}); "
+            "cannot parse a count target."
+        )
+    return text_blocks[0].strip().strip('."\'')
 
 
 def evaluate_result(
@@ -129,8 +134,13 @@ def evaluate_result(
             ],
         }],
     )
-    text = next(b.text for b in response.content if b.type == "text")
-    return json.loads(text)
+    text_blocks = [b.text for b in response.content if b.type == "text"]
+    if not text_blocks:
+        raise RuntimeError(
+            f"Claude returned no text content (stop_reason={response.stop_reason!r}); "
+            "cannot parse an evaluation result."
+        )
+    return json.loads(text_blocks[0])
 
 
 ACCEPT_SCORE_THRESHOLD = 7

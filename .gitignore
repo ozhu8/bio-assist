@@ -16,4 +16,5 @@ train_manager_output*/
 manager_agent_output*/
 manager_*_output/
 manager_trial_output/
+countgd_agent_output/
 *.log

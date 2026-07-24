@@ -51,6 +51,7 @@ def build_checkpoint(text: str):
 
     before = text[:last_marker_pos]
     notes = []
+    total = 0
     for m in IMAGE_RE.finditer(before):
         _, total, image_id, agent, initial, final, accepted = m.groups()
         notes.append({
@@ -59,7 +60,7 @@ def build_checkpoint(text: str):
             "accepted": accepted == "True", "adjustments": [],
             "output_characteristics": "(reconstructed from log by checkpoint_extract.py -- detail not preserved)",
         })
-    total = int(m.group(2)) if notes else 0
+    total = int(total) if notes else 0
     return running_prompt, notes, total
 
 
