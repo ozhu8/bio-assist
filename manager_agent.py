@@ -223,6 +223,69 @@ class QwenVLM:
         return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
 
 
+CLAUDE_MODEL_ID = "claude-sonnet-5"
+
+
+class ClaudeVLM:
+    """Drop-in replacement for QwenVLM's ask_images/ask_text -- the only two methods
+    ExpertReasoner actually calls on its qwen client (grep confirmed: no ask/ask_json/
+    ask_json_multi usage there). Passing a ClaudeVLM instance into ExpertReasoner(...) instead of
+    a QwenVLM one switches the Expert to Claude with zero changes to ExpertReasoner itself --
+    duck typing, not inheritance. The Manager's own decision-making calls (ask_json etc.) are
+    untouched and keep using the local Qwen instance. Reads ANTHROPIC_API_KEY from the
+    environment via the SDK's default credential resolution (see bio-assist/.env) -- never
+    hardcode a key here."""
+
+    def __init__(self, model_id: str = CLAUDE_MODEL_ID):
+        self.model_id = model_id
+        self._client = None
+
+    def _load(self):
+        if self._client is None:
+            import anthropic # pyright: ignore[reportMissingImports]
+            self._client = anthropic.Anthropic()
+        return self._client
+
+    def ask_images(self, image_paths: list, prompt: str, max_new_tokens: int = 512) -> str:
+        import base64
+        import mimetypes
+        client = self._load()
+        content = []
+        for path in image_paths:
+            media_type = mimetypes.guess_type(path)[0] or "image/png"
+            with open(path, "rb") as f:
+                data = base64.standard_b64encode(f.read()).decode("utf-8")
+            content.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})
+        content.append({"type": "text", "text": prompt})
+        response = client.messages.create(
+            model=self.model_id, max_tokens=max_new_tokens,
+            thinking={"type": "disabled"},  # short structured Q&A -- no need for extended reasoning here
+            messages=[{"role": "user", "content": content}],
+        )
+        return next(b.text for b in response.content if b.type == "text").strip()
+
+    def ask_text(self, prompt: str, max_new_tokens: int = 512) -> str:
+        client = self._load()
+        response = client.messages.create(
+            model=self.model_id, max_tokens=max_new_tokens,
+            thinking={"type": "disabled"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return next(b.text for b in response.content if b.type == "text").strip()
+
+
+_claude_vlm = None
+
+
+def get_claude_vlm() -> ClaudeVLM:
+    """Lazy module-level singleton, same idea as QwenVLM's own lazy _load() -- one Anthropic
+    client reused across every ExpertReasoner construction rather than a fresh one per case."""
+    global _claude_vlm
+    if _claude_vlm is None:
+        _claude_vlm = ClaudeVLM()
+    return _claude_vlm
+
+
 def select_agent(qwen: QwenVLM, task_description: str, image_path: str) -> str:
     # stardist vs. cellvit is the pair most likely to get routing-confused (both operate on
     # nuclei/tissue images) -- worth spot-checking a few ambiguous prompts (e.g. "count the
@@ -575,6 +638,27 @@ def _apply_expert_notes(dossier: str, expert_notes: str) -> str:
     return f"[PRIVATE -- accumulated notes from prior escalations this run]\n{expert_notes}\n\n{dossier}"
 
 
+def format_qa_log(qa_log: list) -> str:
+    """Renders checkpoint.json's escalation_qa_log -- the raw, verbatim question/answer history
+    from every human-resolved escalation this run (see resolve_escalations.py) -- into text for
+    the expert's dossier. Unlike expert_notes (an LLM-generated paraphrase, rewritten from
+    scratch on every new escalation via merge_expert_notes, which can drop or reword older
+    specifics as it generalizes), entries here are appended once and never rewritten, so a
+    specific past question/answer stays available verbatim instead of only surviving in
+    whatever generalized form the last summarization pass kept. Callers fold this in alongside
+    expert_notes (e.g. `expert_notes + format_qa_log(qa_log)`) rather than through
+    _apply_expert_notes directly, so no run_*_with_feedback signature needs to change."""
+    if not qa_log:
+        return ""
+    lines = ["[PRIVATE -- verbatim log of past escalation Q&A this run, never paraphrased]"]
+    for entry in qa_log:
+        lines.append(f"On {entry['image_id']}:")
+        for turn in entry["conversation"]:
+            lines.append(f"  Q: {turn['question']}")
+            lines.append(f"  A: {turn['answer']}")
+    return "\n".join(lines)
+
+
 def build_countgd_dossier(ground_truth_count: int, image_path: str) -> str:
     lines = [f"[PRIVATE -- never reveal] Verified true object count: {ground_truth_count}."]
     metadata = _parse_bbbc005_metadata(image_path)
@@ -738,22 +822,54 @@ class ExpertReasoner:
 
     def ask_human_question(self, image_paths: list, task_description: str, dialogue_so_far: list) -> str:
         """Counterpart to manager_ask_expert, direction reversed: there the manager (no ground
-        truth) asks the expert something; here the expert (holding ground truth privately) is the
-        one probing, of a human reviewer, about a specific region/detection it wants their read
-        on before it can give useful feedback -- e.g. "does the cluster in the top-left look like
-        one nucleus or two to you?" Same leak-check discipline as answer(): the question itself
-        must never state the private ground-truth number."""
+        truth) asks the expert something; here the expert (holding ground truth privately)
+        already knows the right label for this case, but the point of asking is NOT to extract or
+        confirm that label -- it's to build the general reasoning that connects observable
+        evidence to the correct conclusion, so the expert actually gets better at this, rather
+        than just being handed the answer each time. Question-TYPE selection is need-driven, not
+        a rotation/checklist: the expert first identifies the SPECIFIC thing it's uncertain about
+        that's actually blocking a confident explanation here (not "more detail" in general),
+        then asks about whichever observable angle -- contour/shape, internal texture/pattern,
+        comparison to neighbors, relative size/density, staining/intensity, or surrounding
+        context -- actually matches that gap. The question must request a DESCRIPTION of what's
+        observed, never hand the human a verdict to confirm: never a binary "is it A or B" -- that
+        forces a decision instead of reporting evidence. The expert draws the actual conclusion
+        itself afterward, from the human's description. Same leak-check discipline as answer():
+        the question itself must never state the private ground-truth number.
+
+        (Two prior versions of this were tried and reverted: cross-escalation phrasing-variety
+        tracking plus extra never-X rules made the model stop grounding in the actual image and
+        reuse a canned description verbatim across genuinely different cases; adding causal/
+        expectation angles drawn from Graesser's question taxonomy -- on top of this same
+        feature-specification base -- brought back both the banned disjunctive "A or B" framing
+        and a trailing enumerated-list pattern, confirmed on 2/5 live test cases, with no gain in
+        genuine type variety to show for it (all 5 converged on one new template anyway). Both
+        reverted; this is the simpler version that tested cleanly. Root cause of the ceiling this
+        prompt does still have (biased toward one or two angles rather than truly picking based on
+        need) is likely model-scale-limited, not further fixable by more prompt text -- confirmed
+        empirically: even handing the model the automated loop's own correct diagnosis
+        ("recall issue" vs "misclassification") as explicit context didn't change which angle it
+        picked.)"""
         prompt = (
             f"{self.persona}\n\n{self.dossier}\n\n"
             f"Task: \"{task_description}\"\n"
             f"This case was escalated to a human reviewer because the automated retry loop never "
             f"reached an acceptable result on its own.\n"
             f"Conversation so far: {json.dumps(dialogue_so_far, default=str)}\n\n"
-            "Ask the human ONE focused question about a specific region, detection, or possible "
-            "discrepancy you want their visual judgment on -- something that would help you "
-            "explain what's wrong once you have their read on it. Do not ask for a count, a "
-            "verdict, or state the private ground-truth number/mask above. Reply with only the "
-            "question, no preamble."
+            "You already privately know the correct answer here. Your goal is NOT to get the "
+            "human to confirm or hand you that answer -- it's to build the reasoning that "
+            "connects observable evidence to it. First identify the ONE specific thing you're "
+            "uncertain about that's actually blocking a confident explanation of this case -- not "
+            "'I need more detail' in general, but the particular kind of observation that would "
+            "resolve it. Then pick whichever angle actually matches that gap: the contour/"
+            "boundary shape of a structure, its internal texture or pattern, how it compares to "
+            "its neighbors, its relative size or density, its staining/color intensity, or what "
+            "surrounds it -- choose based on what you genuinely need to know for THIS case. Ask "
+            "the human ONE open-ended question requesting a DESCRIPTION of that specific thing. "
+            "Never phrase it as a choice between two predetermined options (no 'is it A or B', no "
+            "'does it look like X or Y') -- that forces a decision instead of supplying evidence. "
+            "Do not ask for a count, a verdict, a cell-type name, or state the private "
+            "ground-truth number/mask above. Reply with only the question, no preamble."
         )
         response = self.qwen.ask_images(image_paths, prompt, max_new_tokens=150).strip()
         for _ in range(EXPERT_LEAK_MAX_RETRIES):
@@ -766,7 +882,7 @@ class ExpertReasoner:
             response = self.qwen.ask_images(image_paths, prompt + f"\n\n{retry_notice}", max_new_tokens=150).strip()
         if self._leaks_forbidden_value(response):
             print("    [expert] leaked the private ground-truth value while forming a question -- returning fallback instead")
-            return "Looking at the final result -- is there a region where the detections look wrong to you?"
+            return "Describe what you observe -- shape, texture, staining -- in the region of this image that looks most uncertain to you."
         return response
 
     def summarize_for_manager(self, task_description: str, image_id: str, conversation: list) -> str:
@@ -945,7 +1061,7 @@ def run_countgd_with_feedback(
     )
     dossier = _apply_expert_notes(dossier, expert_notes)
     expert = ExpertReasoner(
-        qwen, EXPERT_PERSONA_COUNTGD, dossier,
+        get_claude_vlm(), EXPERT_PERSONA_COUNTGD, dossier,
         forbidden_values=[ground_truth_count] if ground_truth_count is not None else [],
     )
 
@@ -956,7 +1072,7 @@ def run_countgd_with_feedback(
     for i in range(1, max_iterations + 1):
         print(f"--- Iteration {i}: CountGD counting {count_target!r} ---")
         annotated_path, predicted_count = run_countgd(countgd_client, image_path, count_target)
-        saved_path = output_dir / f"countgd_iteration_{i}.png"
+        saved_path = output_dir / f"{image_id or 'countgd'}_iteration_{i}.png"
         saved_path.write_bytes(Path(annotated_path).read_bytes())
         print(f"[CountGD] count={predicted_count}")
         iteration_outputs[i] = {"predicted_count": predicted_count, "path": saved_path}
@@ -1387,7 +1503,7 @@ def run_stardist_with_feedback(
         dossier = NO_GROUND_TRUTH_DOSSIER
     dossier = _apply_expert_notes(dossier, expert_notes)
     expert = ExpertReasoner(
-        qwen, EXPERT_PERSONA_STARDIST, dossier,
+        get_claude_vlm(), EXPERT_PERSONA_STARDIST, dossier,
         forbidden_values=[int(ground_truth_labels.max())] if ground_truth_labels is not None else [],
     )
 
@@ -1398,7 +1514,7 @@ def run_stardist_with_feedback(
                              # just the last/accepted one, so choose_best_output can compare all of them
     for i in range(1, max_iterations + 1):
         print(f"--- Iteration {i}: StarDist prob_thresh={prob_thresh:.3f}, nms_thresh={nms_thresh:.3f} ---")
-        saved_path = output_dir / f"stardist_iteration_{i}.png"
+        saved_path = output_dir / f"{image_id or 'stardist'}_iteration_{i}.png"
         result = worker.run(image, prob_thresh, nms_thresh, ground_truth_labels, saved_path)
         labels = result["labels"]
         predicted_count = int(labels.max())
@@ -1561,7 +1677,7 @@ def run_cellvit_with_feedback(
     )
     dossier = _apply_expert_notes(dossier, expert_notes)
     expert = ExpertReasoner(
-        qwen, EXPERT_PERSONA_CELLVIT, dossier,
+        get_claude_vlm(), EXPERT_PERSONA_CELLVIT, dossier,
         forbidden_values=[int(v) for v in ground_truth_counts_by_type.values()]
         if ground_truth_counts_by_type is not None else [],
     )
@@ -1578,7 +1694,7 @@ def run_cellvit_with_feedback(
         predicted_count = len(matched_cells)
         print(f"[CellViT] matched count={predicted_count}, all detected by type={counts_by_type}")
 
-        saved_path = output_dir / f"cellvit_iteration_{i}.png"
+        saved_path = output_dir / f"{image_id or 'cellvit'}_iteration_{i}.png"
         annotated.save(saved_path)
         iteration_outputs[i] = {"predicted_count": predicted_count, "counts_by_type": counts_by_type, "path": saved_path}
 
@@ -1704,7 +1820,7 @@ def run_deepgleason_with_feedback(
     )
     dossier = _apply_expert_notes(dossier, expert_notes)
     forbidden_values = deepgleason_forbidden_values(ground_truth_gleason_score, ground_truth_isup_grade)
-    expert = ExpertReasoner(qwen, EXPERT_PERSONA_DEEPGLEASON, dossier, forbidden_values=forbidden_values)
+    expert = ExpertReasoner(get_claude_vlm(), EXPERT_PERSONA_DEEPGLEASON, dossier, forbidden_values=forbidden_values)
 
     history = []
     for i in range(1, max_iterations + 1):
@@ -1958,6 +2074,15 @@ def main():
         help="Known true ISUP grade group (1-5) -- same private-ExpertReasoner treatment as "
              "--ground-truth-gleason-score; also backs the internal_isup_mae logging metric",
     )
+    parser.add_argument(
+        "--checkpoint", default=None,
+        help="Path to a checkpoint.json written by train_manager.py/resolve_escalations.py -- if "
+             "given, its expert_notes (LLM-summarized guidance) and escalation_qa_log (verbatim "
+             "past Q&A, see format_qa_log) are loaded and folded into this one-off call's private "
+             "ExpertReasoner dossier, same as train_manager.py/evaluate_manager.py already do for "
+             "batch runs. Read-only -- never updated or written back. Omit for a checkpoint-free "
+             "run (expert_notes stays empty, the pre-existing default).",
+    )
     args = parser.parse_args()
     if args.image is None and args.pannuke_index is None and args.slide is None:
         parser.error("one of --image, --pannuke-index, or --slide is required")
@@ -2006,6 +2131,16 @@ def main():
         if args.ground_truth_counts_by_type is not None:
             ground_truth_counts_by_type = json.loads(Path(args.ground_truth_counts_by_type).read_text())
 
+    expert_notes = ""
+    if args.checkpoint:
+        loaded_checkpoint = json.loads(Path(args.checkpoint).read_text())
+        expert_notes = loaded_checkpoint.get("expert_notes", "")
+        escalation_qa_log = loaded_checkpoint.get("escalation_qa_log", [])
+        if escalation_qa_log:
+            expert_notes = expert_notes + "\n\n" + format_qa_log(escalation_qa_log)
+        print(f"Loaded {args.checkpoint}: expert_notes are {len(loaded_checkpoint.get('expert_notes', ''))} "
+              f"chars, escalation_qa_log has {len(escalation_qa_log)} resolved case(s). Read-only.")
+
     assert image_path is not None, "one of --image, --pannuke-index, or --slide is required"
     result = manager.run(
         args.task, image_path, args.max_iterations, args.output_dir,
@@ -2014,7 +2149,7 @@ def main():
         ground_truth_class_labels=ground_truth_class_labels,
         ground_truth_gleason_score=args.ground_truth_gleason_score,
         ground_truth_isup_grade=args.ground_truth_isup_grade,
-        tissue=tissue, slide_path=slide_path,
+        tissue=tissue, slide_path=slide_path, expert_notes=expert_notes,
     )
 
     print("\n=== Final result ===")

@@ -27,6 +27,7 @@ Usage:
 """
 import argparse
 import json
+import subprocess
 from pathlib import Path
 from typing import Dict
 
@@ -36,7 +37,7 @@ from manager_agent import (
     EXPERT_PERSONA_CELLVIT, EXPERT_PERSONA_COUNTGD, EXPERT_PERSONA_DEEPGLEASON, EXPERT_PERSONA_STARDIST,
     MODEL_ID, NO_GROUND_TRUTH_DOSSIER, ExpertReasoner, QwenVLM, _apply_expert_notes, build_cellvit_dossier,
     build_countgd_dossier, build_deepgleason_dossier, build_stardist_dossier, deepgleason_forbidden_values,
-    run_human_expert_dialogue,
+    format_qa_log, get_claude_vlm, run_human_expert_dialogue,
 )
 from train_manager import merge_escalation_feedback, merge_expert_notes
 
@@ -46,6 +47,20 @@ from train_manager import merge_escalation_feedback, merge_expert_notes
 # build_countgd_dossier(None, ...) would produce a nonsensical "Verified true object count: None."
 # Both are guarded below to fall back to it instead, same as every run_*_with_feedback loop in
 # manager_agent.py already does when it has no real ground truth to build a dossier from.
+
+
+def open_image(path: str) -> None:
+    """Launches the OS's default viewer for path via xdg-open (non-blocking -- Popen, not run,
+    so the script doesn't wait for the viewer window to be closed before asking the expert's
+    first question). Best-effort: a headless session (no DISPLAY, e.g. a bare SSH shell with no
+    X forwarding) will fail to actually pop a window, so this never raises -- it just falls back
+    to printing the path for you to open by hand, same as before this existed."""
+    try:
+        subprocess.Popen(
+            ["xdg-open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        print(f"  (couldn't auto-open image: {exc} -- open {path!r} yourself)")
 
 
 def load_pending(queue_dir: Path) -> list:
@@ -62,12 +77,21 @@ def resolve_one(qwen: QwenVLM, record_path: Path, record: Dict, checkpoint_path:
     print(f"\n=== Escalation: {image_id} ({record['agent']}) ===")
     print(f"Task: {record['task_description']}")
     print(f"Final output image: {record['final_image_path']}")
-    print("Open the image above yourself -- the expert will ask you about specific things in it.\n")
+    open_image(record["final_image_path"])
+    print("Opening the image above now -- if it doesn't pop up, open it yourself; "
+          "the expert will ask you about specific things in it.\n")
 
     # Read fresh (not cached at program start) so an escalation resolved earlier in this same
     # session -- or by a train_manager.py run still going concurrently -- is already reflected:
-    # expert_notes accumulates across every escalation resolved, not just this one.
-    expert_notes = json.loads(checkpoint_path.read_text()).get("expert_notes", "")
+    # expert_notes/escalation_qa_log accumulate across every escalation resolved, not just this
+    # one. expert_notes is folded together with escalation_qa_log's verbatim Q&A (format_qa_log)
+    # before being handed to _apply_expert_notes below -- see format_qa_log's own docstring for
+    # why the raw log is kept separate from (and never overwrites) the LLM-paraphrased notes.
+    fresh_checkpoint = json.loads(checkpoint_path.read_text())
+    expert_notes = fresh_checkpoint.get("expert_notes", "")
+    escalation_qa_log = fresh_checkpoint.get("escalation_qa_log", [])
+    if escalation_qa_log:
+        expert_notes = expert_notes + "\n\n" + format_qa_log(escalation_qa_log)
 
     if record["agent"] == "stardist":
         ground_truth_labels = np.load(record["ground_truth_path"]) if record.get("ground_truth_path") else None
@@ -77,7 +101,7 @@ def resolve_one(qwen: QwenVLM, record_path: Path, record: Dict, checkpoint_path:
         )
         dossier = _apply_expert_notes(dossier, expert_notes)
         expert = ExpertReasoner(
-            qwen, EXPERT_PERSONA_STARDIST, dossier,
+            get_claude_vlm(), EXPERT_PERSONA_STARDIST, dossier,
             forbidden_values=[int(ground_truth_labels.max())] if ground_truth_labels is not None else [],
         )
     elif record["agent"] == "cellvit":
@@ -88,7 +112,7 @@ def resolve_one(qwen: QwenVLM, record_path: Path, record: Dict, checkpoint_path:
         )
         dossier = _apply_expert_notes(dossier, expert_notes)
         expert = ExpertReasoner(
-            qwen, EXPERT_PERSONA_CELLVIT, dossier,
+            get_claude_vlm(), EXPERT_PERSONA_CELLVIT, dossier,
             forbidden_values=[int(v) for v in ground_truth_counts_by_type.values()]
             if ground_truth_counts_by_type is not None else [],
         )
@@ -102,7 +126,7 @@ def resolve_one(qwen: QwenVLM, record_path: Path, record: Dict, checkpoint_path:
         )
         dossier = _apply_expert_notes(dossier, expert_notes)
         expert = ExpertReasoner(
-            qwen, EXPERT_PERSONA_DEEPGLEASON, dossier,
+            get_claude_vlm(), EXPERT_PERSONA_DEEPGLEASON, dossier,
             forbidden_values=deepgleason_forbidden_values(gleason_score, isup_grade),
         )
     else:
@@ -113,7 +137,7 @@ def resolve_one(qwen: QwenVLM, record_path: Path, record: Dict, checkpoint_path:
         )
         dossier = _apply_expert_notes(dossier, expert_notes)
         expert = ExpertReasoner(
-            qwen, EXPERT_PERSONA_COUNTGD, dossier,
+            get_claude_vlm(), EXPERT_PERSONA_COUNTGD, dossier,
             forbidden_values=[ground_truth_count] if ground_truth_count is not None else [],
         )
 
@@ -135,8 +159,9 @@ def resolve_one(qwen: QwenVLM, record_path: Path, record: Dict, checkpoint_path:
     checkpoint["expert_notes"] = merge_expert_notes(
         qwen, checkpoint.get("expert_notes", ""), image_id, expert_summary
     )
+    checkpoint.setdefault("escalation_qa_log", []).append({"image_id": image_id, "conversation": conversation})
     checkpoint_path.write_text(json.dumps(checkpoint, indent=2, default=str))
-    print(f"Merged into {checkpoint_path}'s running prompt and expert notes.")
+    print(f"Merged into {checkpoint_path}'s running prompt, expert notes, and escalation Q&A log.")
 
     record["status"] = "resolved"
     record["human_conversation"] = conversation
