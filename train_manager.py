@@ -29,7 +29,8 @@ from PIL import Image # pyright: ignore[reportMissingImports]
 
 from bbbc005 import load_bbbc005_samples
 from manager_agent import (
-    ManagerAgent, MODEL_ID, run_cellvit_with_feedback, run_countgd_with_feedback, run_stardist_with_feedback,
+    ManagerAgent, MODEL_ID, format_qa_log, run_cellvit_with_feedback, run_countgd_with_feedback,
+    run_stardist_with_feedback,
 )
 
 
@@ -326,11 +327,13 @@ def interleave_tasks(*task_lists: list) -> list:
     return tasks
 
 
-def save_checkpoint(path: Path, notes: list, running_prompt: str, expert_notes: str, total_tasks: int) -> None:
+def save_checkpoint(
+    path: Path, notes: list, running_prompt: str, expert_notes: str, escalation_qa_log: list, total_tasks: int,
+) -> None:
     completed_ids = [n["image_id"] for n in notes]
     path.write_text(json.dumps({
         "completed_ids": completed_ids, "running_prompt": running_prompt, "expert_notes": expert_notes,
-        "notes": notes,
+        "escalation_qa_log": escalation_qa_log, "notes": notes,
     }, indent=2, default=str))
     print(f"[checkpoint] {path} ({len(completed_ids)}/{total_tasks} images)")
 
@@ -397,13 +400,24 @@ def main():
     notes = []
     running_prompt = ""
     expert_notes = ""
+    escalation_qa_log = []
     if args.resume_from:
         checkpoint = json.loads(Path(args.resume_from).read_text())
         notes = checkpoint["notes"]
         running_prompt = checkpoint["running_prompt"]
         expert_notes = checkpoint.get("expert_notes", "")  # absent in checkpoints written before this existed
+        escalation_qa_log = checkpoint.get("escalation_qa_log", [])  # ditto
         print(f"Resumed from {args.resume_from}: {len(notes)} images already done, "
-              f"running prompt is {len(running_prompt)} chars, expert notes are {len(expert_notes)} chars.")
+              f"running prompt is {len(running_prompt)} chars, expert notes are {len(expert_notes)} chars, "
+              f"escalation Q&A log has {len(escalation_qa_log)} resolved case(s).")
+
+    # expert_notes is an LLM-generated paraphrase that gets rewritten from scratch on every new
+    # escalation (merge_expert_notes), which can drop/reword older specifics as it generalizes;
+    # escalation_qa_log is the same escalations' raw questions/answers, appended once and never
+    # rewritten (see format_qa_log). Folding both into what's actually handed to the expert this
+    # run means a specific past correction survives verbatim, not just in whatever generalized
+    # form the last summarization pass happened to keep.
+    expert_context = expert_notes + (("\n\n" + format_qa_log(escalation_qa_log)) if escalation_qa_log else "")
 
     completed_ids = {n["image_id"] for n in notes}
     remaining_tasks = [t for t in tasks if t["image_id"] not in completed_ids]
@@ -417,17 +431,17 @@ def main():
         if task["agent"] == "countgd":
             note = run_countgd_trial(
                 manager, task["image_path"], task["image_id"], task["ground_truth_count"],
-                args.max_iterations, output_dir, expert_notes=expert_notes,
+                args.max_iterations, output_dir, expert_notes=expert_context,
             )
         elif task["agent"] == "cellvit":
             note = run_cellvit_trial(
                 manager, task["image_path"], task["image_id"], task["ground_truth_counts_by_type"],
-                task["ground_truth_class_labels"], args.max_iterations, output_dir, expert_notes=expert_notes,
+                task["ground_truth_class_labels"], args.max_iterations, output_dir, expert_notes=expert_context,
             )
         else:
             note = run_stardist_trial(
                 manager, task["image_path"], task["image_id"], task["ground_truth_labels"],
-                args.max_iterations, output_dir, expert_notes=expert_notes,
+                args.max_iterations, output_dir, expert_notes=expert_context,
             )
         notes.append(note)
         new_notes.append(note)
@@ -440,7 +454,7 @@ def main():
             print(f"--- batch stats ---\n{json.dumps(stats, indent=2)}")
             running_prompt = summarize_and_merge(manager.qwen, running_prompt, batch, stats)
             print(f"--- updated training prompt ---\n{running_prompt}\n")
-            save_checkpoint(checkpoint_path, notes, running_prompt, expert_notes, len(tasks))
+            save_checkpoint(checkpoint_path, notes, running_prompt, expert_notes, escalation_qa_log, len(tasks))
 
     out_path = output_dir / "training_result.json"
     out_path.write_text(json.dumps({"final_prompt": running_prompt, "notes": notes}, indent=2, default=str))

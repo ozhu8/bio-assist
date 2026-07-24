@@ -32,7 +32,7 @@ import argparse
 import json
 from pathlib import Path
 
-from manager_agent import ManagerAgent, MODEL_ID
+from manager_agent import ManagerAgent, MODEL_ID, format_qa_log
 from train_manager import (
     build_cellvit_tasks, build_countgd_tasks, build_stardist_tasks, compute_batch_stats,
     interleave_tasks, run_cellvit_trial, run_countgd_trial, run_stardist_trial,
@@ -71,9 +71,16 @@ def main():
     trained_checkpoint = json.loads(Path(args.trained_checkpoint).read_text())
     running_prompt = trained_checkpoint.get("running_prompt", "")
     expert_notes = trained_checkpoint.get("expert_notes", "")
+    escalation_qa_log = trained_checkpoint.get("escalation_qa_log", [])
+    # Same fold-in as train_manager.py's expert_context -- the raw, never-paraphrased Q&A log
+    # alongside the LLM-summarized expert_notes -- so held-out evaluation sees exactly what a
+    # real training/inference run would, not a subset of it. Still read-only: this local
+    # variable is never written back to args.trained_checkpoint.
+    expert_context = expert_notes + (("\n\n" + format_qa_log(escalation_qa_log)) if escalation_qa_log else "")
     print(f"Loaded {args.trained_checkpoint}: running_prompt is {len(running_prompt)} chars, "
-          f"expert_notes are {len(expert_notes)} chars. Both held FIXED for this run -- neither "
-          f"is updated or written back to that checkpoint.")
+          f"expert_notes are {len(expert_notes)} chars, escalation_qa_log has "
+          f"{len(escalation_qa_log)} resolved case(s). All held FIXED for this run -- none of "
+          f"it is updated or written back to that checkpoint.")
 
     for flag_name, split_value in (("--bbbc005-split", args.bbbc005_split), ("--pannuke-split", args.pannuke_split)):
         if split_value == "all":
@@ -103,18 +110,18 @@ def main():
         if task["agent"] == "countgd":
             note = run_countgd_trial(
                 manager, task["image_path"], task["image_id"], task["ground_truth_count"],
-                args.max_iterations, output_dir, expert_notes=expert_notes, escalate=False,
+                args.max_iterations, output_dir, expert_notes=expert_context, escalate=False,
             )
         elif task["agent"] == "cellvit":
             note = run_cellvit_trial(
                 manager, task["image_path"], task["image_id"], task["ground_truth_counts_by_type"],
                 task["ground_truth_class_labels"], args.max_iterations, output_dir,
-                expert_notes=expert_notes, escalate=False,
+                expert_notes=expert_context, escalate=False,
             )
         else:
             note = run_stardist_trial(
                 manager, task["image_path"], task["image_id"], task["ground_truth_labels"],
-                args.max_iterations, output_dir, expert_notes=expert_notes, escalate=False,
+                args.max_iterations, output_dir, expert_notes=expert_context, escalate=False,
             )
         notes.append(note)
         print(f"  initial={note['initial_score']}  final={note['final_score']}  accepted={note['accepted']}")
