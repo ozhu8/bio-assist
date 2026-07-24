@@ -261,7 +261,15 @@ def main():
         annotated_path, predicted_count = run_countgd(countgd, args.image, count_target)
         print(f"[CountGD] count={predicted_count}")
 
-        saved_path = output_dir / f"iteration_{i}.png"
+        # Preserve CountGD's actual output format (e.g. .webp) instead of hardcoding .png -- a
+        # mismatched extension makes evaluate_result's declared image media type wrong (guessed
+        # from the .png extension via mimetypes.guess_type), which the Claude API rejects with a
+        # 400 (confirmed live: CountGD returned a webp image saved as iteration_1.png, and
+        # evaluate_result's image_to_content_block then declared it image/png while the actual
+        # bytes were image/webp). See app.py's run_agentic_pipeline, which already carries this
+        # same fix for its own copy of this loop.
+        annotated_suffix = Path(annotated_path).suffix or ".png"
+        saved_path = output_dir / f"iteration_{i}{annotated_suffix}"
         saved_path.write_bytes(Path(annotated_path).read_bytes())
         saved_paths.append(saved_path)
 
