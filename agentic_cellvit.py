@@ -196,8 +196,19 @@ def run_cellvit(inferer, image_path: str, magnification: float, target_classes: 
         if cell["type"] == background_id:
             continue
         cells.append({
-            # CellViT stores contour points as (row, col); flip to (x, y) for PIL drawing.
-            "contour": [(pt[1], pt[0]) for pt in cell["contour"]],
+            # CellViT's contours are ALREADY (x, y) -- do not swap. They come from cv2.findContours
+            # (post_proc_cellvit.py), whose points are (x, y) by OpenCV convention, and CellViT's
+            # own offset code labels the axes explicitly:
+            #     inst_contour[:, 0] += inst_bbox[0][1]  # X   (column)
+            #     inst_contour[:, 1] += inst_bbox[0][0]  # Y   (row)
+            # An earlier version of this line assumed (row, col) and swapped to "fix" it, which
+            # transposed every nucleus across the image diagonal. That corrupted BOTH the scored
+            # geometry and the annotation overlay the manager/expert actually look at, while
+            # leaving the nucleus COUNT correct -- so it read as "CellViT classifies badly" rather
+            # than as a coordinate bug. Measured on 3 PanNuke train tiles (2026-07-28): mean mPQ
+            # 0.0083 swapped vs 0.5101 unswapped, the latter matching the ~0.50 the CellViT paper
+            # reports on PanNuke.
+            "contour": [(int(pt[0]), int(pt[1])) for pt in cell["contour"]],
             "type": int(cell["type"]),
             "type_name": name_by_id.get(cell["type"], "Unknown"),
             "type_prob": float(cell["type_prob"]),
