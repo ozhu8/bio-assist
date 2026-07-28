@@ -21,21 +21,25 @@ to MAX_EXPERT_TURNS question/answer turns with the expert: it can ask about a
 specific detection, cluster, or discrepancy it's unsure about, and the expert
 answers in 2-4 sentences of morphological/domain rationale -- instructed to
 never reveal the ground-truth number/mask or say accept/reject/correct/wrong
-(see EXPERT_PERSONA_COUNTGD / EXPERT_PERSONA_STARDIST). The manager then
-decides accept/reject itself from the dialogue transcript plus the image,
-and if rejecting, proposes the revision itself (a revised count target for
-CountGD, revised prob_thresh/nms_thresh for StarDist) -- mirroring
-evaluate_result in agentic_countgd.py/agentic_stardist.py, but the judgment
-now comes from Qwen reasoning through a dialogue rather than a hard MAE/PQ
-threshold.
+(see EXPERT_PERSONA_COUNTGD / EXPERT_PERSONA_STARDIST). The manager still
+runs this dialogue and proposes a revision itself when rejecting (a revised
+count target for CountGD, revised prob_thresh/nms_thresh for StarDist,
+revised target_classes/prob_threshold for CellViT) -- mirroring evaluate_result
+in agentic_countgd.py/agentic_stardist.py -- but accept/reject itself is no
+longer the dialogue's own call.
 
-The old metric (MAE against the ground-truth count / Panoptic Quality against
-the ground-truth mask) is still computed every iteration when ground truth is
-available, but purely for the run's own history/logging -- as
-"internal_mae"/"internal_pq" plus what the old threshold-based rule would
-have decided ("internal_would_accept") -- so the new dialogue-driven
-judgments can be compared against the old hard-threshold ones after the
-fact. The manager's own prompts never include these numbers.
+Whenever ground truth is available, accept/reject is decided by a hard
+quantitative metric instead of the dialogue's own verdict: MAE (mean absolute
+error against the true count) for CountGD, and PQ (panoptic quality against
+the true instance mask -- mean matched-instance IoU x TP/(TP+0.5FP+0.5FN),
+the standard PanNuke/HoVer-Net/CellViT-benchmark metric) for StarDist and
+CellViT (per-class mPQ for CellViT, since it's classifying, not just
+segmenting). These are logged as "internal_mae"/"internal_pq"/"internal_mpq"
+plus "internal_would_accept" (now literally what became entry["accept"]) --
+see ACCEPT_PQ_THRESHOLD/MAE_TOLERANCE_FRACTION below for the actual
+thresholds. Only when no ground truth exists (e.g. a real user upload with no
+known answer) is there nothing objective to grade against, so accept/reject
+falls back to the dialogue's own judgment -- the only signal available then.
 
 If no ground truth is supplied for the routed agent (a generic image with no
 known answer), there's no expert to consult either, so Qwen falls back to
@@ -100,8 +104,8 @@ from agentic_countgd import COUNTGD_SPACE, run_countgd
 # StarDist's own worker functions import agentic_stardist locally.
 
 MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
-ACCEPT_PQ_THRESHOLD = 0.5   # old PQ rule, kept only to log internal_would_accept -- see module docstring
-MAE_TOLERANCE_FRACTION = 0.1  # old MAE rule, kept only to log internal_would_accept -- see module docstring
+ACCEPT_PQ_THRESHOLD = 0.5   # StarDist/CellViT accept/reject cutoff when ground truth exists -- see module docstring
+MAE_TOLERANCE_FRACTION = 0.1  # CountGD accept/reject tolerance when ground truth exists -- see module docstring
 MAX_EXPERT_TURNS = 3  # cap on manager<->expert question/answer turns per iteration
 
 # Ground-truth-free sanity check for StarDist: how many instances would survive at a much
@@ -125,6 +129,102 @@ STARDIST_COVERAGE_MIN_CANDIDATES = 5  # don't fire the guardrail on images with 
 # means every retry loop spends its budget clawing back a shortfall baked in from iteration 1.
 # Starting lower gives iteration 1 a real shot at adequate coverage instead.
 STARDIST_INITIAL_PROB_THRESH = 0.5
+
+# Ground-truth-free sanity check for CountGD, mirroring STARDIST_CANDIDATE_FLOOR's role above --
+# manager_ask_expert's own prompt already instructs the manager to check for missed regions, not
+# just split/merge issues on existing detections, but that's only a prompt instruction, and it
+# wasn't reliably followed: observed directly, a 7-detection result on an image with many more
+# visibly identical, undetected repeating cell structures elsewhere got a full 3-turn dialogue
+# that only asked about whether individual highlights were over/under-segmented -- never once
+# about the obviously uncovered regions -- and was accepted. Below this floor, force reject
+# regardless of what the dialogue concluded, the same way STARDIST_COVERAGE_RATIO_MIN does.
+COUNTGD_COVERAGE_RATIO_MIN = 30
+
+
+def compute_coverage_signal(annotated_image_path: str) -> tuple:
+    """Ground-truth-free heuristic: finds CountGD's detection dots/boxes as brightness peaks,
+    then measures what fraction of the image's visibly-structured (textured) area actually falls
+    within reach of a detection. A low coverage percentage is concrete, computed evidence of a
+    broad miss -- fed into the dialogue-driven decision as text so it doesn't rest entirely on
+    whatever the manager<->expert dialogue happened to explore (see COUNTGD_COVERAGE_RATIO_MIN's
+    comment above for why a prompt instruction alone wasn't enough).
+
+    Unlike an earlier version of this check (a fixed 8x8 grid with a fixed 6px mask radius),
+    both the masking radius and the texture-analysis scale here are tied to the image's own
+    typical inter-detection spacing (median nearest-neighbor distance between detections), not a
+    one-size-fits-all constant -- a fixed grid systematically undercounted coverage for
+    elongated or unusually large/small objects, since a single correctly-placed detection on a
+    long object could still leave OTHER fixed grid cells covering the same object looking
+    "structured but uncovered" purely due to the size mismatch between the object and the grid.
+
+    Returns (text, coverage_pct) -- coverage_pct is None when there aren't enough detections to
+    establish a spacing baseline (fewer than 2), otherwise 0-100."""
+    import numpy as np
+    from PIL import Image
+    from scipy import ndimage
+    from scipy.spatial import cKDTree
+    from skimage.feature import peak_local_max
+
+    img_rgb = np.array(Image.open(annotated_image_path).convert("RGB")).astype(float)
+    img_gray = img_rgb.mean(axis=-1)
+    h, w = img_gray.shape
+
+    brightness = ndimage.gaussian_filter(img_gray, sigma=1.2)
+    coords = peak_local_max(brightness, min_distance=6, threshold_abs=brightness.max() * 0.5)
+    if len(coords) < 2:
+        return "Coverage check: too few detections to establish a spacing baseline; skip this check.", None
+
+    tree = cKDTree(coords)
+    nn_dists, _ = tree.query(coords, k=2)  # k=2: nearest OTHER detection (k=1 is itself, dist 0)
+    typical_spacing = float(np.median(nn_dists[:, 1]))
+    coverage_radius = max(8.0, typical_spacing * 0.6)
+
+    # Mask out detected peaks (radius scaled to typical spacing, not a fixed 6px) before
+    # measuring texture, so the bright detection markers themselves don't dominate the signal.
+    masked = img_gray.copy()
+    background_level = np.median(img_gray)
+    mask_r = int(coverage_radius)
+    for row, col in coords:
+        r0, r1 = max(0, row - mask_r), min(h, row + mask_r)
+        c0, c1 = max(0, col - mask_r), min(w, col + mask_r)
+        masked[r0:r1, c0:c1] = background_level
+
+    # Local texture via a box-filter variance (fast: two uniform_filter passes, not a per-pixel
+    # Python callback) at a window size tied to typical object spacing -- not a fixed grid, which
+    # is exactly what mismatched actual object size/shape before.
+    win = max(3, int(typical_spacing))
+    mean = ndimage.uniform_filter(masked, size=win)
+    mean_sq = ndimage.uniform_filter(masked**2, size=win)
+    local_std = np.sqrt(np.clip(mean_sq - mean**2, 0, None))
+
+    nonzero = local_std[local_std > 0]
+    if nonzero.size == 0:
+        return "Coverage check: no clearly structured regions found; skip this check.", None
+    structure_threshold = np.median(nonzero) * 0.5
+    has_structure = local_std >= structure_threshold
+    structured_pixels = int(has_structure.sum())
+    if structured_pixels == 0:
+        return "Coverage check: no clearly structured regions found; skip this check.", None
+
+    detection_mask = np.zeros((h, w), dtype=bool)
+    detection_mask[coords[:, 0].astype(int), coords[:, 1].astype(int)] = True
+    dist_to_detection = ndimage.distance_transform_edt(~detection_mask)
+    covered = dist_to_detection <= coverage_radius * 1.5
+
+    covered_structured = int((has_structure & covered).sum())
+    coverage_pct = round(100 * covered_structured / structured_pixels)
+
+    return (
+        f"Coverage check (automated measurement, not your own visual judgment): analyzed at a "
+        f"scale matched to the typical spacing between detections (~{typical_spacing:.0f}px), "
+        f"not a fixed grid, so it accounts for elongated or unusually large/small objects. "
+        f"Only {coverage_pct}% of the image's clearly textured/structured area (likely "
+        f"containing objects) falls within reach of a detection. A low percentage here is "
+        f"strong independent evidence of a broad miss covering whole regions, even if the "
+        f"detections that do exist look individually correct -- weigh this alongside your own "
+        f"look at the image, don't ignore it just because the placed detections seem fine.",
+        coverage_pct,
+    )
 
 
 def mae_accept_tolerance(ground_truth_count: int) -> float:
@@ -246,19 +346,51 @@ class ClaudeVLM:
             self._client = anthropic.Anthropic()
         return self._client
 
+    def _create_with_retry(self, client, max_retries: int = 5, **kwargs):
+        """Retries transient Claude API failures (rate limits, connection drops, 5xx/overloaded)
+        with exponential backoff -- a multi-day unattended train_manager.py run shouldn't crash
+        on a brief blip that would have succeeded a few seconds later. Deliberately does NOT
+        retry non-transient errors (bad request, auth failure, insufficient credit balance) --
+        those won't resolve themselves on a retry; train_manager.py's own outer try/except is
+        what handles those, by saving a checkpoint and exiting cleanly instead of crashing
+        mid-batch with a raw traceback."""
+        import time
+        import anthropic # pyright: ignore[reportMissingImports]
+        transient = (
+            anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.APITimeoutError,
+            anthropic.InternalServerError, anthropic.OverloadedError,
+        )
+        for attempt in range(max_retries):
+            try:
+                return client.messages.create(**kwargs)
+            except transient as exc:
+                if attempt == max_retries - 1:
+                    raise
+                wait = 10 * (2 ** attempt)  # 10s, 20s, 40s, 80s, 160s
+                print(f"  [ClaudeVLM] transient error ({exc.__class__.__name__}), retrying in "
+                      f"{wait}s (attempt {attempt + 1}/{max_retries})...")
+                time.sleep(wait)
+
     def ask_images(self, image_paths: list, prompt: str, max_new_tokens: int = 512) -> str:
         import base64
-        import mimetypes
+        from PIL import Image # pyright: ignore[reportMissingImports]
         client = self._load()
         content = []
         for path in image_paths:
-            media_type = mimetypes.guess_type(path)[0] or "image/png"
+            # Detect the real format from the file's own bytes (PIL sniffs the actual
+            # header/magic bytes) instead of guessing from the filename extension -- observed
+            # directly: a mismatched/lying extension (e.g. a JPEG saved with a .png name) made
+            # Claude's API reject the request with a 400 (media_type said png, the bytes were
+            # actually jpeg). PIL's format name ("JPEG", "PNG", ...) needs lowercasing, and "jpg"
+            # normalized to "jpeg", to match the image/<subtype> media type Claude expects.
+            pil_format = (Image.open(path).format or "PNG").lower()
+            media_type = f"image/{'jpeg' if pil_format == 'jpg' else pil_format}"
             with open(path, "rb") as f:
                 data = base64.standard_b64encode(f.read()).decode("utf-8")
             content.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})
         content.append({"type": "text", "text": prompt})
-        response = client.messages.create(
-            model=self.model_id, max_tokens=max_new_tokens,
+        response = self._create_with_retry(
+            client, model=self.model_id, max_tokens=max_new_tokens,
             thinking={"type": "disabled"},  # short structured Q&A -- no need for extended reasoning here
             messages=[{"role": "user", "content": content}],
         )
@@ -266,8 +398,8 @@ class ClaudeVLM:
 
     def ask_text(self, prompt: str, max_new_tokens: int = 512) -> str:
         client = self._load()
-        response = client.messages.create(
-            model=self.model_id, max_tokens=max_new_tokens,
+        response = self._create_with_retry(
+            client, model=self.model_id, max_tokens=max_new_tokens,
             thinking={"type": "disabled"},
             messages=[{"role": "user", "content": prompt}],
         )
@@ -355,21 +487,33 @@ def decide_countgd_from_dialogue(
 ) -> dict:
     """Ground truth is never given to the manager (see module docstring) -- instead the manager
     has just talked to ExpertReasoner (run_expert_dialogue) and decides accept/reject itself from
-    that transcript plus the image, proposing a revised count target if rejecting."""
+    that transcript plus the image, proposing a revised count target if rejecting. Deliberately
+    leads with the manager's own look at the image, ahead of the dialogue transcript, and frames
+    the dialogue as a way to double-check specific uncertainties rather than the primary
+    evidence -- observed directly that a verbose multi-turn expert transcript can otherwise
+    dominate the decision purely by being so much longer/more detailed than a single glance at
+    the image, even when the image itself would settle the question on its own."""
     prompt = (
         f"Original user request: \"{task_description}\"\n"
         f"CountGD was asked to count: \"{count_target}\"\n"
-        f"Predicted count: {predicted_count}\n"
+        f"Predicted count: {predicted_count}\n\n"
+        "Look at the attached image yourself first and form your own independent visual "
+        "judgment: does the count and placement of detections look right for what's actually "
+        "visible -- clusters correctly split or merged, faint/overlapping objects handled "
+        "reasonably, no obvious missed regions or over-counted noise? Your own look at the image "
+        "is the primary evidence here.\n\n"
         f"Your conversation with the domain expert this iteration:\n{json.dumps(dialogue, default=str)}\n"
         f"Prior attempts this session: {json.dumps(_redact_history_for_manager(history), default=str)}\n"
-        "Compare this attempt against those prior ones: did predicted_count and the dialogue's "
-        "findings actually improve, or did the last change not help (or make things worse)? "
-        "Don't assume a later attempt is better just because it came later -- check whether the "
-        "specific concerns raised in past feedback were actually resolved this time.\n\n"
-        "Based on the expert's reasoning and what you can see in the image yourself, decide "
-        "whether this result satisfies the request. If not, propose a different/more specific "
-        "text prompt for CountGD to retry with, informed by what the expert pointed out (e.g. "
-        "overlapping cells, faint/out-of-focus cells, background clutter).\n\n"
+        "Use the dialogue above to double-check specific things you're unsure about after "
+        "looking at the image yourself -- not as a substitute for actually looking. Compare this "
+        "attempt against prior ones: did predicted_count and what you can see actually improve, "
+        "or did the last change not help? Don't assume a later attempt is better just because it "
+        "came later -- check whether the specific concerns raised in past feedback were actually "
+        "resolved this time.\n\n"
+        "Decide whether this result satisfies the request. If not, propose a different/more "
+        "specific text prompt for CountGD to retry with, informed by what you saw and what the "
+        "expert pointed out (e.g. overlapping cells, faint/out-of-focus cells, background "
+        "clutter).\n\n"
         "Reply with ONLY a JSON object matching this schema: "
         "{\"accept\": bool, \"feedback\": str (1-2 sentences), \"revised_text\": str or null}"
     )
@@ -1009,43 +1153,86 @@ def choose_best_output(qwen: QwenVLM, task_description: str, candidates: list) -
     quality across iterations is common here, not a rare edge case)."""
     if len(candidates) == 1:
         return {"chosen_iteration": candidates[0]["iteration"], "reasoning": "only one attempt was made"}
-    image_paths = [c["image_path"] for c in candidates]
-    listing = "\n".join(f"Image {i + 1} = iteration {c['iteration']}: {c['summary']}" for i, c in enumerate(candidates))
+
+    # Never let a visual "which looks best" judgment override a genuinely accepted result with a
+    # rejected one -- restrict the comparison to whichever accept-tier is actually available.
+    parsed = []
+    for c in candidates:
+        try:
+            summary_dict = json.loads(c["summary"])
+        except (ValueError, json.JSONDecodeError):
+            summary_dict = {}
+        parsed.append({**c, "_accept": summary_dict.get("accept"), "_predicted_count": summary_dict.get("predicted_count")})
+    accepted = [c for c in parsed if c["_accept"]]
+    pool = accepted if accepted else parsed
+    if len(pool) == 1:
+        return {"chosen_iteration": pool[0]["iteration"], "reasoning": "only one candidate in the relevant accept tier"}
+
+    image_paths = [c["image_path"] for c in pool]
+    listing = "\n".join(f"Image {i + 1} = iteration {c['iteration']}: {c['summary']}" for i, c in enumerate(pool))
     prompt = (
         f"Original task: \"{task_description}\"\n"
-        f"You attempted this {len(candidates)} times with different settings; each attached image "
-        f"is one attempt's output, in this order:\n{listing}\n\n"
-        "Look at all the attached images yourself and pick whichever attempt's output actually "
-        "looks best -- don't assume a later attempt is better just because it came later, and "
-        "don't rely only on the text summaries above; judge the images directly, the same way you "
-        "would if you had no other information about which attempt was 'supposed to be' better.\n\n"
+        f"You attempted this {len(pool)} times with different settings; each attached image is "
+        f"one attempt's output, in this order:\n{listing}\n\n"
+        "Each summary above already reflects a full multi-turn conversation with a domain expert "
+        "about that specific attempt -- treat it as your primary evidence, not something to set "
+        "aside in favor of a fresh visual glance. Use the images to double-check specific claims "
+        "in the summaries (e.g. confirm a described miss or double-count is really visible "
+        "there), not to override a summary's verdict just because one image looks more complete "
+        "or densely populated with detections -- more detections is not automatically better if "
+        "that summary already identified them as wrong (e.g. over-splitting, false positives), "
+        "and fewer/zero detections is not automatically safer if that summary already identified "
+        "the result as an outright miss.\n\n"
         "Reply with ONLY a JSON object: {\"chosen_iteration\": int, \"reasoning\": str (1-2 sentences)}"
     )
     result = qwen.ask_json_multi(image_paths, prompt, max_new_tokens=300, required_keys=["chosen_iteration", "reasoning"])
-    valid_iterations = {c["iteration"] for c in candidates}
+    valid_iterations = {c["iteration"] for c in pool}
     if result["chosen_iteration"] not in valid_iterations:
         print(f"  [choose_best_output] manager picked iteration {result['chosen_iteration']!r}, not one of "
               f"{sorted(valid_iterations)} -- falling back to the last attempt")
-        result["chosen_iteration"] = candidates[-1]["iteration"]
+        result["chosen_iteration"] = pool[-1]["iteration"]
+
+    # Hard numeric sanity floor, backstopping the prompt-level guidance above -- observed
+    # directly: asked to pick among 3 rejected CountGD attempts (predicted_count 0, 62, 62), the
+    # model picked the 0, despite its own summary already calling it "incorrect...failed to
+    # identify any cells despite clear visual evidence." A predicted_count of 0 (or far below
+    # another candidate's) is essentially never actually the best pick when a higher, non-zero
+    # alternative exists in the same pool, regardless of what the model concluded visually.
+    counts = {c["iteration"]: c["_predicted_count"] for c in pool if c["_predicted_count"] is not None}
+    if counts:
+        chosen_count = counts.get(result["chosen_iteration"])
+        max_count = max(counts.values())
+        if chosen_count is not None and max_count > 0 and chosen_count < max_count * 0.2:
+            best_iteration = max(counts, key=lambda it: counts[it])
+            print(
+                f"  [guardrail] choose_best_output picked iteration {result['chosen_iteration']} "
+                f"(predicted_count={chosen_count}), far below iteration {best_iteration}'s "
+                f"{max_count} -- overriding to the higher count", flush=True,
+            )
+            result["chosen_iteration"] = best_iteration
+            result["reasoning"] = (
+                f"[guardrail override] {result['reasoning']} (overridden: predicted_count "
+                f"{chosen_count} is far below the {max_count} found in iteration {best_iteration})"
+            )
     return result
 
 
 def run_countgd_with_feedback(
     qwen: QwenVLM, countgd_client: Client, image_path: str, task_description: str,
     max_iterations: int, output_dir: Path, ground_truth_count: int | None = None,
-    image_id: str | None = None, expert_notes: str = "", escalate: bool = True,
+    image_id: str | None = None, expert_notes: str = "", escalate: bool = True, progress_cb=None,
 ) -> dict:
     """The manager always consults a private ExpertReasoner (never shown ground truth itself --
-    see module docstring) via a multi-turn dialogue (run_expert_dialogue) and decides
-    accept/reject itself from the transcript (decide_countgd_from_dialogue), whether or not
-    ground_truth_count is given. When it isn't, the expert has no private answer either --
-    NO_GROUND_TRUTH_DOSSIER tells it to reason from what's actually visible in the image, not
-    fabricate a verdict -- so the manager still gets structured multi-turn scrutiny of specific
-    regions/detections instead of a single blind self-score. The old MAE rule is still computed
-    for history/logging only when real ground truth exists (internal_mae/internal_would_accept
-    -- see module docstring), never used for the decision either way. If the loop never reaches
-    accept=True, the case is queued for human review (write_escalation) instead of silently
-    shipping the last attempt -- requires image_id. escalate=False suppresses that queuing
+    see module docstring) via a multi-turn dialogue (run_expert_dialogue) and proposes a revised
+    count target from the transcript (decide_countgd_from_dialogue) when rejecting. When
+    ground_truth_count is given, accept/reject itself is decided purely by MAE against it
+    (internal_mae/internal_would_accept -- see module docstring), not by the dialogue's own
+    verdict. When it isn't, the expert has no private answer either -- NO_GROUND_TRUTH_DOSSIER
+    tells it to reason from what's actually visible in the image, not fabricate a verdict -- and
+    accept/reject falls back to the dialogue's own judgment, the only signal available then. If
+    the loop never reaches accept=True, the case is queued for human review (write_escalation)
+    instead of silently shipping the last attempt -- requires image_id. escalate=False suppresses
+    that queuing
     entirely regardless of image_id -- used by evaluate_manager.py so a held-out test image that
     never gets accepted doesn't end up in the escalation_queue a human might later resolve,
     which would otherwise let test-set corrections leak back into expert_notes/running_prompt
@@ -1054,6 +1241,8 @@ def run_countgd_with_feedback(
     reasoning stays consistent across images too, not just the manager's running_prompt."""
     count_target = interpret_countgd_target(qwen, task_description, image_path)
     print(f"[Qwen] counting target: {count_target!r}")
+    if progress_cb:
+        progress_cb(0.10, f"Starting with count target: \"{count_target}\"")
 
     dossier = (
         build_countgd_dossier(ground_truth_count, image_path) if ground_truth_count is not None
@@ -1070,12 +1259,29 @@ def run_countgd_with_feedback(
     predicted_count = None
     iteration_outputs = {}  # iteration -> {"predicted_count": int, "path": Path} -- every attempt
     for i in range(1, max_iterations + 1):
+        iter_start = 0.10 + (i - 1) / max_iterations * 0.80
+        iter_mid = 0.10 + (i - 1 + 0.5) / max_iterations * 0.80
+        iter_end = 0.10 + i / max_iterations * 0.80
+
+        if progress_cb:
+            progress_cb(iter_start, f"Iteration {i}: running the model on \"{count_target}\"…")
         print(f"--- Iteration {i}: CountGD counting {count_target!r} ---")
         annotated_path, predicted_count = run_countgd(countgd_client, image_path, count_target)
         saved_path = output_dir / f"{image_id or 'countgd'}_iteration_{i}.png"
         saved_path.write_bytes(Path(annotated_path).read_bytes())
         print(f"[CountGD] count={predicted_count}")
         iteration_outputs[i] = {"predicted_count": predicted_count, "path": saved_path}
+        if progress_cb:
+            progress_cb(iter_mid, f"Iteration {i}: the model found {predicted_count} — the agent is evaluating…")
+
+        coverage_signal, coverage_pct = compute_coverage_signal(str(saved_path))
+        print(f"    [coverage] {coverage_pct}%  {coverage_signal}", flush=True)
+        guardrail_triggered = coverage_pct is not None and coverage_pct < COUNTGD_COVERAGE_RATIO_MIN
+        if guardrail_triggered:
+            print(
+                f"  [guardrail] coverage {coverage_pct}% is below the {COUNTGD_COVERAGE_RATIO_MIN}% "
+                f"floor -- overriding accept=False regardless of the dialogue", flush=True,
+            )
 
         dialogue = run_expert_dialogue(
             qwen, expert, task_description, f"predicted count = {predicted_count}",
@@ -1084,19 +1290,48 @@ def run_countgd_with_feedback(
         decision = decide_countgd_from_dialogue(
             qwen, task_description, count_target, predicted_count, dialogue, str(saved_path), history,
         )
-        accept, revised_text, feedback = decision["accept"], decision.get("revised_text"), decision["feedback"]
+        dialogue_accept, revised_text, feedback = decision["accept"], decision.get("revised_text"), decision["feedback"]
+        # A "revision" that repeats the current target changes nothing -- treat it as no revision
+        # at all, same reasoning as StarDist's prob_thresh/nms_thresh and CellViT's
+        # target_classes/prob_threshold epsilon checks. Observed directly: iterations 2 and 3 both
+        # ran with the exact same count_target and got the exact same predicted_count, wasting a
+        # full retry iteration on a no-op instead of actually addressing what iteration 2's own
+        # feedback had already identified (over-splitting on overlapping cells).
+        if revised_text is not None and revised_text.strip().lower() == count_target.strip().lower():
+            revised_text = None
+
+        # accept/reject is graded purely on MAE against the ground truth count when it's
+        # available (see module docstring) -- the dialogue still runs and still supplies
+        # feedback/revised_text to steer the next attempt, but its own accept/reject verdict
+        # is only followed when there's no ground truth to grade against instead.
+        internal_mae = internal_would_accept = None
+        if ground_truth_count is not None:
+            internal_mae = abs(predicted_count - ground_truth_count)
+            internal_would_accept = internal_mae <= mae_accept_tolerance(ground_truth_count)
+            accept = internal_would_accept
+            print(f"[manager] accept={accept}  (MAE={internal_mae}, dialogue verdict was accept={dialogue_accept})")
+        else:
+            accept = dialogue_accept
+            print(f"[manager] accept={accept}")
+
+        if guardrail_triggered:
+            accept = False
+            feedback = (
+                f"[guardrail override] Only {coverage_pct}% of the image's structured area is "
+                f"within reach of a detection -- overriding accept regardless of the grading rule. "
+                f"{feedback}"
+            )
+            if not revised_text:
+                revised_text = f"small, faint, or partially-obscured {count_target}"
         entry = {
             "iteration": i, "count_target": count_target, "predicted_count": predicted_count,
             "dialogue": dialogue, "accept": accept, "feedback": feedback,
         }
-        if ground_truth_count is not None:
-            internal_mae = abs(predicted_count - ground_truth_count)
-            internal_would_accept = internal_mae <= mae_accept_tolerance(ground_truth_count)
-            print(f"[manager] accept={accept}  (internal_mae={internal_mae}, old-rule would_accept={internal_would_accept})")
+        if internal_mae is not None:
             entry["internal_mae"], entry["internal_would_accept"] = internal_mae, internal_would_accept
-        else:
-            print(f"[manager] accept={accept}")
         history.append(entry)
+        if progress_cb:
+            progress_cb(iter_end, f"Iteration {i} evaluated (accept={accept})")
 
         if accept or not revised_text:
             break
@@ -1371,11 +1606,33 @@ class CellvitClient:
         if self._inferer is None:
             from agentic_cellvit import load_cellvit_module
             CellSegmentationInference, color_dict = load_cellvit_module(self.cellvit_repo)
-            self._inferer = CellSegmentationInference(
-                model_path=self.checkpoint, gpu=self.gpu, enforce_mixed_precision=self.enforce_amp
-            )
+            self._inferer = self._construct_with_retry(CellSegmentationInference)
             self._color_dict = color_dict
         return self._inferer, self._color_dict
+
+    def _construct_with_retry(self, CellSegmentationInference, max_retries: int = 6):
+        """CUDA initialization here can transiently fail with "RuntimeError: No CUDA GPUs are
+        available" on a shared single-GPU machine if another process currently holds the
+        device's HIP/ROCm compute context -- observed directly (2026-07-24): this hardware
+        appears to only support one process holding that context at a time, and a concurrent
+        process's own training run intermittently blocked this exact call. Retries with a real
+        wait between attempts instead of crashing outright, since the device reliably becomes
+        available again once the other process's own GPU-touching step finishes. Only retries
+        when the message actually mentions CUDA unavailability -- any other RuntimeError (a
+        real, non-transient problem) still propagates immediately."""
+        import time
+        for attempt in range(max_retries):
+            try:
+                return CellSegmentationInference(
+                    model_path=self.checkpoint, gpu=self.gpu, enforce_mixed_precision=self.enforce_amp
+                )
+            except RuntimeError as exc:
+                if "no cuda" not in str(exc).lower() or attempt == max_retries - 1:
+                    raise
+                wait = 30 * (attempt + 1)  # 30s, 60s, 90s, 120s, 150s
+                print(f"  [CellvitClient] CUDA unavailable (likely another process holding the "
+                      f"GPU context) -- retrying in {wait}s (attempt {attempt + 1}/{max_retries})...")
+                time.sleep(wait)
 
     def run(self, image_path: str, target_classes: set, prob_threshold: float):
         from agentic_cellvit import run_cellvit
@@ -1474,19 +1731,19 @@ def write_escalation(
 def run_stardist_with_feedback(
     qwen: QwenVLM, worker: StardistWorker, image_path: str, task_description: str,
     max_iterations: int, output_dir: Path, ground_truth_labels: np.ndarray | None = None, tissue: str | None = None,
-    image_id: str | None = None, expert_notes: str = "", escalate: bool = True,
+    image_id: str | None = None, expert_notes: str = "", escalate: bool = True, progress_cb=None,
 ) -> dict:
     """The manager always consults a private ExpertReasoner (never shown ground truth itself --
-    see module docstring) via a multi-turn dialogue (run_expert_dialogue) and decides
-    accept/reject itself from the transcript (decide_stardist_from_dialogue), whether or not
-    ground_truth_labels is given. When it is (a PanNuke-style instance mask), the expert also
-    gets a one-time outline rendering of the true instance boundaries and, if known, the PanNuke
-    tissue type. When it isn't, the expert has no private answer either -- NO_GROUND_TRUTH_DOSSIER
-    tells it to reason from what's actually visible in the image, not fabricate a verdict -- so
-    the manager still gets structured multi-turn scrutiny instead of a single blind self-score.
-    The old PQ rule is still computed for history/logging only when real ground truth exists
-    (internal_pq/internal_would_accept -- see module docstring), never used for the decision
-    either way. If the loop never reaches accept=True, the case is queued for human review
+    see module docstring) via a multi-turn dialogue (run_expert_dialogue) and proposes revised
+    thresholds from the transcript (decide_stardist_from_dialogue) when rejecting. When
+    ground_truth_labels is given (a PanNuke-style instance mask), the expert also gets a one-time
+    outline rendering of the true instance boundaries and, if known, the PanNuke tissue type --
+    and accept/reject itself is decided purely by PQ against that mask (internal_pq/
+    internal_would_accept -- see module docstring), not by the dialogue's own verdict. When it
+    isn't, the expert has no private answer either -- NO_GROUND_TRUTH_DOSSIER tells it to reason
+    from what's actually visible in the image, not fabricate a verdict -- and accept/reject falls
+    back to the dialogue's own judgment, the only signal available then. If the loop never
+    reaches accept=True, the case is queued for human review
     (write_escalation) instead of silently shipping whatever the last/best attempt was --
     requires image_id. escalate=False suppresses that queuing regardless of image_id (see
     run_countgd_with_feedback's docstring for why -- used by evaluate_manager.py). expert_notes
@@ -1494,6 +1751,8 @@ def run_stardist_with_feedback(
     escalations this run, folded into the dossier so the expert's own reasoning stays consistent
     across images too, not just the manager's running_prompt."""
     image, prob_thresh, nms_thresh = worker.init(image_path)
+    if progress_cb:
+        progress_cb(0.10, "Starting nucleus segmentation…")
 
     gt_outlines_path = output_dir / "stardist_ground_truth.png"
     if ground_truth_labels is not None:
@@ -1513,6 +1772,12 @@ def run_stardist_with_feedback(
     iteration_outputs = {}  # iteration -> {"labels": ndarray, "path": Path} -- every attempt, not
                              # just the last/accepted one, so choose_best_output can compare all of them
     for i in range(1, max_iterations + 1):
+        iter_start = 0.10 + (i - 1) / max_iterations * 0.80
+        iter_mid = 0.10 + (i - 1 + 0.5) / max_iterations * 0.80
+        iter_end = 0.10 + i / max_iterations * 0.80
+
+        if progress_cb:
+            progress_cb(iter_start, f"Iteration {i}: running StarDist to segment nuclei…")
         print(f"--- Iteration {i}: StarDist prob_thresh={prob_thresh:.3f}, nms_thresh={nms_thresh:.3f} ---")
         saved_path = output_dir / f"{image_id or 'stardist'}_iteration_{i}.png"
         result = worker.run(image, prob_thresh, nms_thresh, ground_truth_labels, saved_path)
@@ -1520,6 +1785,8 @@ def run_stardist_with_feedback(
         predicted_count = int(labels.max())
         print(f"[StarDist] nuclei={predicted_count}")
         iteration_outputs[i] = {"labels": labels, "path": saved_path}
+        if progress_cb:
+            progress_cb(iter_mid, f"Iteration {i}: StarDist segmented {predicted_count} nuclei — the agent is evaluating…")
 
         candidate_count = result["candidate_count"]
         coverage_ratio = predicted_count / max(candidate_count, 1)
@@ -1540,38 +1807,43 @@ def run_stardist_with_feedback(
         decision = decide_stardist_from_dialogue(
             qwen, task_description, prob_thresh, nms_thresh, predicted_count, dialogue, str(saved_path), history,
         )
-        accept = decision["accept"]
+        dialogue_accept = decision["accept"]
         revised_prob, revised_nms, feedback = decision.get("revised_prob_thresh"), decision.get("revised_nms_thresh"), decision["feedback"]
+
+        # accept/reject is graded purely on PQ against the ground-truth mask when it's available
+        # (see module docstring) -- the dialogue still runs and still supplies feedback/revised
+        # thresholds to steer the next attempt, but its own accept/reject verdict is only
+        # followed when there's no ground truth to grade against instead. pq/mean_iou/tp/fp/fn
+        # keep agentic_stardist.py's own field names (unprefixed) -- best_entry() below (imported
+        # from that untouched module) keys off e["pq"] to pick which attempted iteration to
+        # report as final.
+        pq_result = result["pq_result"]
+        if pq_result is not None:
+            internal_would_accept = bool(pq_result["pq"] >= ACCEPT_PQ_THRESHOLD)
+            tp, fn = pq_result["tp"], pq_result["fn"]
+            internal_recall = tp / (tp + fn) if (tp + fn) else 1.0  # coverage only -- see module docstring
+            accept = internal_would_accept
+            print(f"[manager] accept={accept}  (PQ={pq_result['pq']:.3f}, "
+                  f"internal_recall={internal_recall:.3f}, dialogue verdict was accept={dialogue_accept})")
+        else:
+            accept = dialogue_accept
+            print(f"[manager] accept={accept}")
+
         if guardrail_triggered:
             accept = False
             revised_prob = max(STARDIST_CANDIDATE_FLOOR, prob_thresh - (prob_thresh - STARDIST_CANDIDATE_FLOOR) * 0.5)
             feedback = (f"[guardrail override] {predicted_count}/{candidate_count} candidates kept -- "
-                         f"detection looks suspiciously sparse regardless of dialogue content. {feedback}")
+                         f"detection looks suspiciously sparse regardless of the grading rule. {feedback}")
         entry = {
             "iteration": i, "prob_thresh": prob_thresh, "nms_thresh": nms_thresh,
             "predicted_count": predicted_count, "dialogue": dialogue, "accept": accept, "feedback": feedback,
         }
-        pq_result = result["pq_result"]
         if pq_result is not None:
-            # pq/mean_iou/tp/fp/fn keep agentic_stardist.py's own field names (unprefixed) --
-            # best_entry() below (imported from that untouched module) keys off e["pq"] to pick
-            # which attempted iteration to report as final. None of this is shown to the
-            # manager or the expert; only internal_would_accept/internal_recall are new (the
-            # old threshold rule, and a coverage-only stat -- tp/(tp+fn), how much of the true
-            # object set was even found regardless of outline quality -- logged for comparison
-            # against the manager's dialogue-driven `accept` above, never used to decide it).
-            internal_would_accept = bool(pq_result["pq"] >= ACCEPT_PQ_THRESHOLD)
-            tp, fn = pq_result["tp"], pq_result["fn"]
-            internal_recall = tp / (tp + fn) if (tp + fn) else 1.0  # coverage only -- see module docstring
-            print(f"[manager] accept={accept}  (internal_pq={pq_result['pq']:.3f}, "
-                  f"internal_recall={internal_recall:.3f}, old-rule would_accept={internal_would_accept})")
             entry.update({
                 "pq": pq_result["pq"], "mean_iou": pq_result["mean_iou"],
                 "tp": pq_result["tp"], "fp": pq_result["fp"], "fn": pq_result["fn"],
                 "internal_would_accept": internal_would_accept, "internal_recall": internal_recall,
             })
-        else:
-            print(f"[manager] accept={accept}")
         history.append(entry)
 
         # A "revision" that repeats the current value changes nothing -- treat it as no
@@ -1581,6 +1853,8 @@ def run_stardist_with_feedback(
             revised_prob = None
         if revised_nms is not None and abs(revised_nms - nms_thresh) < 1e-9:
             revised_nms = None
+        if progress_cb:
+            progress_cb(iter_end, f"Iteration {i} evaluated (accept={accept})")
 
         if accept or (revised_prob is None and revised_nms is None):
             break
@@ -1640,19 +1914,20 @@ def run_cellvit_with_feedback(
     max_iterations: int, output_dir: Path,
     ground_truth_counts_by_type: dict | None = None, ground_truth_class_labels: dict | None = None,
     stardist_worker: StardistWorker | None = None, tissue: str | None = None, image_id: str | None = None,
-    expert_notes: str = "", escalate: bool = True,
+    expert_notes: str = "", escalate: bool = True, progress_cb=None,
 ) -> dict:
     """The manager always consults a private ExpertReasoner (never shown ground truth itself --
-    see module docstring) via a multi-turn dialogue (run_expert_dialogue) and decides
-    accept/reject itself from the transcript (decide_cellvit_from_dialogue), whether or not
-    ground_truth_counts_by_type is given. When it is (PanNuke per-class true instance counts), the
-    expert also gets the PanNuke tissue type if known. When it isn't, the expert has no private
-    answer either -- NO_GROUND_TRUTH_DOSSIER tells it to reason from what's actually visible in
-    the image, not fabricate a verdict -- so the manager still gets structured multi-turn scrutiny
-    instead of a single blind self-score. An internal per-class mPQ/F1 score (internal_mpq/
-    internal_f1) is additionally computed for history/logging only -- never used for the decision
-    -- when ground_truth_class_labels (the raw per-class instance-label arrays needed to actually
-    score against, not just count) and stardist_worker are also given. If the loop never reaches
+    see module docstring) via a multi-turn dialogue (run_expert_dialogue) and proposes a revised
+    class selection/threshold from the transcript (decide_cellvit_from_dialogue) when rejecting.
+    When ground_truth_class_labels (the raw per-class instance-label arrays needed to actually
+    score against, not just count) and stardist_worker are also given, a per-class mPQ/F1 score
+    (internal_mpq/internal_f1) is computed and accept/reject itself is decided purely by whether
+    mPQ clears ACCEPT_PQ_THRESHOLD (internal_would_accept -- see module docstring), not by the
+    dialogue's own verdict. ground_truth_counts_by_type (PanNuke per-class true instance counts)
+    additionally gives the expert the PanNuke tissue type if known. When no ground truth is
+    given, the expert has no private answer either -- NO_GROUND_TRUTH_DOSSIER tells it to reason
+    from what's actually visible in the image, not fabricate a verdict -- and accept/reject falls
+    back to the dialogue's own judgment, the only signal available then. If the loop never reaches
     accept=True, the case is queued for human review (write_escalation) instead of silently
     shipping whatever the last/best attempt was -- requires image_id. escalate=False suppresses
     that queuing regardless of image_id (see run_countgd_with_feedback's docstring for why --
@@ -1670,6 +1945,8 @@ def run_cellvit_with_feedback(
     target_classes = set(request["target_classes"])
     prob_threshold = request["prob_threshold"]
     print(f"[Qwen] target classes: {sorted(target_classes)}, prob_threshold={prob_threshold:.2f}")
+    if progress_cb:
+        progress_cb(0.10, f"Starting with target classes: {sorted(target_classes)}")
 
     dossier = (
         build_cellvit_dossier(ground_truth_counts_by_type, tissue) if ground_truth_counts_by_type is not None
@@ -1689,6 +1966,12 @@ def run_cellvit_with_feedback(
     iteration_outputs = {}  # iteration -> {"predicted_count": int, "counts_by_type": dict, "path": Path} --
                              # every attempt, not just the last/accepted one, so choose_best_output can compare all
     for i in range(1, max_iterations + 1):
+        iter_start = 0.10 + (i - 1) / max_iterations * 0.80
+        iter_mid = 0.10 + (i - 1 + 0.5) / max_iterations * 0.80
+        iter_end = 0.10 + i / max_iterations * 0.80
+
+        if progress_cb:
+            progress_cb(iter_start, f"Iteration {i}: running CellViT on {sorted(target_classes)}…")
         print(f"--- Iteration {i}: CellViT highlighting {sorted(target_classes)} (p>={prob_threshold:.2f}) ---")
         annotated, matched_cells, counts_by_type, all_cells = cellvit_client.run(image_path, target_classes, prob_threshold)
         predicted_count = len(matched_cells)
@@ -1697,6 +1980,8 @@ def run_cellvit_with_feedback(
         saved_path = output_dir / f"{image_id or 'cellvit'}_iteration_{i}.png"
         annotated.save(saved_path)
         iteration_outputs[i] = {"predicted_count": predicted_count, "counts_by_type": counts_by_type, "path": saved_path}
+        if progress_cb:
+            progress_cb(iter_mid, f"Iteration {i}: CellViT matched {predicted_count} — the agent is evaluating…")
 
         dialogue = run_expert_dialogue(
             qwen, expert, task_description,
@@ -1708,7 +1993,7 @@ def run_cellvit_with_feedback(
             qwen, task_description, sorted(target_classes), prob_threshold, predicted_count,
             counts_by_type, dialogue, str(saved_path), history,
         )
-        accept = decision["accept"]
+        dialogue_accept = decision["accept"]
         # sanitize/clamp: Qwen has no API-enforced schema for decide_cellvit_from_dialogue's
         # response either, so a hallucinated class name or an out-of-[0,1] threshold would
         # otherwise get applied as-is and silently zero out matches for the rest of the run --
@@ -1717,14 +2002,24 @@ def run_cellvit_with_feedback(
         revised_threshold = cellvit_module.clamp_prob_threshold(decision.get("revised_prob_threshold"))
         feedback = decision["feedback"]
 
-        internal_mpq = internal_f1 = per_class_scores = None
+        # accept/reject is graded purely on per-class mPQ against the ground-truth instance
+        # labels when it's available (see module docstring) -- the dialogue still runs and still
+        # supplies feedback/revised classes/threshold to steer the next attempt, but its own
+        # accept/reject verdict is only followed when there's no ground truth to grade against
+        # instead. mPQ (mean panoptic quality across the target classes) is used rather than
+        # plain PQ since CellViT classifies as well as segments.
+        internal_mpq = internal_f1 = internal_would_accept = per_class_scores = None
         if ground_truth_class_labels is not None and stardist_worker is not None:
             image_shape = next(iter(ground_truth_class_labels.values())).shape
             score_result = stardist_worker.score_cellvit_predictions(all_cells, ground_truth_class_labels, image_shape)
             internal_mpq, internal_f1 = score_result["internal_mpq"], score_result["internal_f1"]
             per_class_scores = score_result["per_class"]
-            print(f"[manager] accept={accept}  (internal_mpq={internal_mpq:.3f}, internal_f1={internal_f1:.3f})")
+            internal_would_accept = bool(internal_mpq >= ACCEPT_PQ_THRESHOLD)
+            accept = internal_would_accept
+            print(f"[manager] accept={accept}  (mPQ={internal_mpq:.3f}, internal_f1={internal_f1:.3f}, "
+                  f"dialogue verdict was accept={dialogue_accept})")
         else:
+            accept = dialogue_accept
             print(f"[manager] accept={accept}")
 
         history.append({
@@ -1732,6 +2027,7 @@ def run_cellvit_with_feedback(
             "predicted_count": predicted_count, "counts_by_type": counts_by_type,
             "dialogue": dialogue, "accept": accept, "feedback": feedback,
             "internal_mpq": internal_mpq, "internal_f1": internal_f1, "per_class_scores": per_class_scores,
+            "internal_would_accept": internal_would_accept,
         })
 
         # A "revision" that repeats the current config changes nothing -- treat it as no
@@ -1740,6 +2036,8 @@ def run_cellvit_with_feedback(
             revised_classes = None
         if revised_threshold is not None and abs(revised_threshold - prob_threshold) < 1e-9:
             revised_threshold = None
+        if progress_cb:
+            progress_cb(iter_end, f"Iteration {i} evaluated (accept={accept})")
 
         if accept or (revised_classes is None and revised_threshold is None):
             break
@@ -1785,7 +2083,7 @@ def run_deepgleason_with_feedback(
     qwen: QwenVLM, deepgleason_client: DeepGleasonClient, slide_path: str, task_description: str,
     max_iterations: int, output_dir: Path,
     ground_truth_gleason_score: str | None = None, ground_truth_isup_grade: int | None = None,
-    image_id: str | None = None, expert_notes: str = "", escalate: bool = True,
+    image_id: str | None = None, expert_notes: str = "", escalate: bool = True, progress_cb=None,
 ) -> dict:
     """The manager always consults a private ExpertReasoner (never shown ground truth itself --
     see module docstring) via a multi-turn dialogue (run_expert_dialogue) and decides
@@ -1809,9 +2107,13 @@ def run_deepgleason_with_feedback(
     loop never reaches accept=True, the case is queued for human review (write_escalation) --
     requires image_id. escalate=False suppresses that queuing regardless of image_id (see
     run_countgd_with_feedback's docstring for why -- used by evaluate_manager.py)."""
+    if progress_cb:
+        progress_cb(0.05, "Running DeepGleason tile classification — this can take a while on a large slide…")
     deepgleason_client.run_slide(slide_path, output_dir)
     preview_path = deepgleason_client.preview_path
     confidence_threshold = DEEPGLEASON_INITIAL_CONFIDENCE_THRESHOLD
+    if progress_cb:
+        progress_cb(0.60, "Tile classification done — aggregating into a Gleason score…")
 
     dossier = (
         build_deepgleason_dossier(ground_truth_gleason_score, ground_truth_isup_grade)
@@ -1824,6 +2126,11 @@ def run_deepgleason_with_feedback(
 
     history = []
     for i in range(1, max_iterations + 1):
+        iter_start = 0.60 + (i - 1) / max_iterations * 0.30
+        iter_end = 0.60 + i / max_iterations * 0.30
+
+        if progress_cb:
+            progress_cb(iter_start, f"Iteration {i}: confidence_threshold={confidence_threshold:.2f}…")
         print(f"--- Iteration {i}: DeepGleason confidence_threshold={confidence_threshold:.2f} ---")
         gleason_result = deepgleason_client.aggregate(confidence_threshold)
         print(f"[DeepGleason] {gleason_result}")
@@ -1855,6 +2162,8 @@ def run_deepgleason_with_feedback(
 
         if revised_threshold is not None and abs(revised_threshold - confidence_threshold) < 1e-9:
             revised_threshold = None
+        if progress_cb:
+            progress_cb(iter_end, f"Iteration {i} evaluated (accept={accept})")
         if accept or revised_threshold is None:
             break
         confidence_threshold = revised_threshold
@@ -1904,7 +2213,11 @@ class ManagerAgent:
     @property
     def countgd_client(self) -> Client:
         if self._countgd_client is None:
-            self._countgd_client = Client(COUNTGD_SPACE)
+            # CountGD's hosted Space sleeps when idle and can take well over the default read
+            # timeout to wake up and respond to the first request -- seen firsthand as "The read
+            # operation timed out" on a cold start, even at 120s (a ZeroGPU Space acquiring
+            # hardware can take longer).
+            self._countgd_client = Client(COUNTGD_SPACE, httpx_kwargs={"timeout": 300})
         return self._countgd_client
 
     @property
@@ -1938,7 +2251,8 @@ class ManagerAgent:
         ground_truth_counts_by_type: dict | None = None, ground_truth_class_labels: dict | None = None,
         ground_truth_gleason_score: str | None = None, ground_truth_isup_grade: int | None = None,
         tissue: str | None = None, image_id: str | None = None, slide_path: str | None = None,
-        expert_notes: str = "", escalate: bool = True,
+        expert_notes: str = "", escalate: bool = True, progress_cb=None,
+        disabled_agents: set[str] | None = None,
     ) -> dict:
         """ground_truth_count (CountGD), ground_truth_labels (StarDist),
         ground_truth_counts_by_type/ground_truth_class_labels (CellViT), and
@@ -1959,19 +2273,43 @@ class ManagerAgent:
         regardless of image_id -- used by evaluate_manager.py so held-out test results never
         enter the escalation_queue (see run_countgd_with_feedback's docstring for why).
 
-        slide_path is DeepGleason-specific: image_path itself must always be something Qwen's
-        vision-language model can actually load for routing/select_agent (a normal-sized image),
-        never a raw whole-slide TIFF (often gigapixel) -- so for a WSI task, pass a small
-        downsampled preview as image_path and the real slide file as slide_path; only the
-        deepgleason branch below uses slide_path (falling back to image_path if omitted, for a
-        caller that already has a small enough slide)."""
+        slide_path, if given, is the real full-resolution file -- image_path is what
+        select_agent() uses for routing and must always be something Qwen's vision-language
+        model can actually load (a normal-sized image or downsampled preview), never a raw
+        whole-slide TIFF (often gigapixel). Whichever agent routing actually picks then uses
+        slide_path or image_path for its OWN processing/interpretation/dialogue calls -- not
+        just the deepgleason branch. This matters beyond deepgleason: observed directly, a huge
+        TIFF that got downsampled to a small Qwen-safe preview for routing, then happened to
+        route to cellvit instead, fed that same tiny preview straight into CellViT's own
+        inference too (no separate full-resolution image to fall back to) -- it found zero
+        cells, because individual nuclei are far too small/blurry to recognize at that scale.
+        Pass the real file as slide_path whenever the upload might be large, regardless of which
+        agent you expect it to route to."""
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         if image_id is None:
             image_id = Path(slide_path if slide_path else image_path).stem
 
+        if progress_cb:
+            progress_cb(0.02, "Deciding which model fits this task…")
         agent = select_agent(self.qwen, task_description, image_path)
         print(f"[Qwen] routed to: {agent}")
+        if progress_cb:
+            progress_cb(0.05, f"Routed to {agent}")
+
+        # select_agent()'s own routing prompt is left untouched here -- it always considers all
+        # four agents -- rather than being made aware of disabled_agents itself, since that would
+        # mean threading an exclusion list through its prompt text for what's meant to be a
+        # deployment-specific restriction (e.g. this web app disabling deepgleason because its
+        # conda env/repo was never set up on this machine -- see CLAUDE.md), not a change to how
+        # routing itself should reason. Rejecting post-hoc is simpler and keeps that prompt
+        # reusable as-is for callers (train_manager.py, the CLI) that don't disable anything.
+        if disabled_agents and agent in disabled_agents:
+            raise ValueError(
+                f"Task routed to '{agent}', which is disabled here. Try rephrasing your request "
+                f"to target a supported task (counting, nucleus segmentation, or cell-type "
+                f"classification)."
+            )
 
         # Fail fast, with an actionable message, right after routing decides on CellViT --
         # otherwise this wouldn't surface until deep inside run_cellvit_with_feedback (after an
@@ -1984,31 +2322,33 @@ class ManagerAgent:
                 "TIO-IKIM/CellViT isn't already on PYTHONPATH) to handle CellViT-routable tasks."
             )
 
+        full_image_path = slide_path or image_path
         if agent == "countgd":
             return run_countgd_with_feedback(
-                self.qwen, self.countgd_client, image_path, task_description, max_iterations, out_dir,
+                self.qwen, self.countgd_client, full_image_path, task_description, max_iterations, out_dir,
                 ground_truth_count=ground_truth_count, image_id=image_id, expert_notes=expert_notes,
-                escalate=escalate,
+                escalate=escalate, progress_cb=progress_cb,
             )
         if agent == "cellvit":
             return run_cellvit_with_feedback(
-                self.qwen, self.cellvit_client, image_path, task_description, max_iterations, out_dir,
+                self.qwen, self.cellvit_client, full_image_path, task_description, max_iterations, out_dir,
                 ground_truth_counts_by_type=ground_truth_counts_by_type,
                 ground_truth_class_labels=ground_truth_class_labels,
                 stardist_worker=self.stardist_worker if ground_truth_class_labels is not None else None,
                 tissue=tissue, image_id=image_id, expert_notes=expert_notes, escalate=escalate,
+                progress_cb=progress_cb,
             )
         if agent == "deepgleason":
             return run_deepgleason_with_feedback(
-                self.qwen, self.deepgleason_client, slide_path or image_path, task_description, max_iterations,
+                self.qwen, self.deepgleason_client, full_image_path, task_description, max_iterations,
                 out_dir, ground_truth_gleason_score=ground_truth_gleason_score,
                 ground_truth_isup_grade=ground_truth_isup_grade, image_id=image_id, expert_notes=expert_notes,
-                escalate=escalate,
+                escalate=escalate, progress_cb=progress_cb,
             )
         return run_stardist_with_feedback(
-            self.qwen, self.stardist_worker, image_path, task_description, max_iterations, out_dir,
+            self.qwen, self.stardist_worker, full_image_path, task_description, max_iterations, out_dir,
             ground_truth_labels=ground_truth_labels, tissue=tissue, image_id=image_id, expert_notes=expert_notes,
-            escalate=escalate,
+            escalate=escalate, progress_cb=progress_cb,
         )
 
 

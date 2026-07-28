@@ -1,0 +1,20 @@
+.venv/
+.venv-*/
+__pycache__/
+*.pyc
+.env
+
+# CellViT integration artifacts -- large/reproducible, not source
+CellViT/
+models/
+cellvit_pannuke_batch_output*/
+pannuke_cellvit_samples*/
+cell_vit_results1.pdf
+
+# training/trial run outputs and logs
+train_manager_output*/
+manager_agent_output*/
+manager_*_output/
+manager_trial_output/
+countgd_agent_output/
+*.log

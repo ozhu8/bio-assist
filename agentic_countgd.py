@@ -14,35 +14,30 @@ import json
 import mimetypes
 import textwrap
 from pathlib import Path
-from typing import Any, Optional, cast
 
-import anthropic # pyright: ignore[reportMissingImports]
-from anthropic.types import ImageBlockParam # pyright: ignore[reportMissingImports]
-import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
-from matplotlib.backends.backend_pdf import PdfPages # pyright: ignore[reportMissingModuleSource]
-from PIL import Image # pyright: ignore[reportMissingImports]
-from gradio_client import Client, handle_file # pyright: ignore[reportMissingImports]
+import anthropic
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from PIL import Image
+from gradio_client import Client, handle_file
 
 MODEL = "claude-opus-4-8"
 COUNTGD_SPACE = "nikigoli/countgd"
 PDF_NAME = "countgd_results.pdf"
 
 
-ALLOWED_IMAGE_MIME_TYPES = ("image/jpeg", "image/png", "image/gif", "image/webp")
-
-
-def image_to_content_block(image_path: str) -> ImageBlockParam:
+def image_to_content_block(image_path: str) -> dict:
     mime_type, _ = mimetypes.guess_type(image_path)
-    if mime_type not in ALLOWED_IMAGE_MIME_TYPES:
+    if mime_type is None:
         mime_type = "image/png"
     data = base64.standard_b64encode(Path(image_path).read_bytes()).decode("utf-8")
-    return cast(ImageBlockParam, {
+    return {
         "type": "image",
         "source": {"type": "base64", "media_type": mime_type, "data": data},
-    })
+    }
 
 
-def unwrap(value: Any) -> Any:
+def unwrap(value):
     """Gradio event-driven outputs arrive as {'value': ..., '__type__': 'update'} dicts."""
     return value["value"] if isinstance(value, dict) and "value" in value else value
 
@@ -76,13 +71,8 @@ def interpret_prompt(claude: anthropic.Anthropic, user_prompt: str, image_path: 
             ],
         }],
     )
-    text_blocks = [b.text for b in response.content if b.type == "text"]
-    if not text_blocks:
-        raise RuntimeError(
-            f"Claude returned no text content (stop_reason={response.stop_reason!r}); "
-            "cannot parse a count target."
-        )
-    return text_blocks[0].strip().strip('."\'')
+    text = next(b.text for b in response.content if b.type == "text")
+    return text.strip().strip('."\'')
 
 
 def evaluate_result(
@@ -134,13 +124,8 @@ def evaluate_result(
             ],
         }],
     )
-    text_blocks = [b.text for b in response.content if b.type == "text"]
-    if not text_blocks:
-        raise RuntimeError(
-            f"Claude returned no text content (stop_reason={response.stop_reason!r}); "
-            "cannot parse an evaluation result."
-        )
-    return json.loads(text_blocks[0])
+    text = next(b.text for b in response.content if b.type == "text")
+    return json.loads(text)
 
 
 ACCEPT_SCORE_THRESHOLD = 7
@@ -175,7 +160,7 @@ def save_pdf_report(
     user_prompt: str,
     image_paths: list,
     history: list,
-    evaluator_note: Optional[str] = None,
+    evaluator_note: str = None,
 ) -> None:
     """Render a methodology page, then one page per iteration (annotated image + feedback), into a single PDF."""
     with PdfPages(pdf_path) as pdf:
@@ -236,12 +221,10 @@ def main():
     parser = argparse.ArgumentParser(description="Run CountGD with Claude as orchestrator/evaluator")
     parser.add_argument("--image", required=True, help="Path to the input image")
     parser.add_argument("--prompt", required=True, help="What to count / user instruction")
-    parser.add_argument("--max-iterations", type=int, default=5)
+    parser.add_argument("--max-iterations", type=int, default=3)
     parser.add_argument("--output-dir", default="./countgd_agent_output")
     parser.add_argument("--pdf-name", default=PDF_NAME, help="Filename for the saved PDF report")
     args = parser.parse_args()
-    if args.max_iterations < 1:
-        parser.error("--max-iterations must be at least 1")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -261,15 +244,7 @@ def main():
         annotated_path, predicted_count = run_countgd(countgd, args.image, count_target)
         print(f"[CountGD] count={predicted_count}")
 
-        # Preserve CountGD's actual output format (e.g. .webp) instead of hardcoding .png -- a
-        # mismatched extension makes evaluate_result's declared image media type wrong (guessed
-        # from the .png extension via mimetypes.guess_type), which the Claude API rejects with a
-        # 400 (confirmed live: CountGD returned a webp image saved as iteration_1.png, and
-        # evaluate_result's image_to_content_block then declared it image/png while the actual
-        # bytes were image/webp). See app.py's run_agentic_pipeline, which already carries this
-        # same fix for its own copy of this loop.
-        annotated_suffix = Path(annotated_path).suffix or ".png"
-        saved_path = output_dir / f"iteration_{i}{annotated_suffix}"
+        saved_path = output_dir / f"iteration_{i}.png"
         saved_path.write_bytes(Path(annotated_path).read_bytes())
         saved_paths.append(saved_path)
 

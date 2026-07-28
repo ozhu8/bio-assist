@@ -1,469 +1,325 @@
 """
 Agentic nucleus-segmentation pipeline: Claude orchestrates StarDist.
 
-Unlike CountGD (agentic_countgd.py, a hosted Gradio Space taking a free-text
-object name) or CellViT (a local checkpoint-based classifier), StarDist
-(https://github.com/stardist/stardist) is a local, pretrained instance
-segmentation model. Its `2D_versatile_he` weights ship inside the `stardist`
-pip package itself, so no separate checkpoint download is needed. The model
-takes no text prompt -- it just segments every nucleus it finds -- so there is
-no free-text target for Claude to interpret going in (contrast with
-`interpret_prompt` in agentic_countgd.py).
+Structural sibling to agentic_countgd.py, but for StarDist2D instead of
+CountGD: StarDist has no free-text "count target" to interpret (it always
+segments nuclei), so there's nothing for Claude to do before the first run.
+Instead Claude's job is entirely on the evaluation side -- score the outlined
+result and, if it's not good enough, propose revised prob_thresh/nms_thresh
+(raise prob_thresh for false positives, lower it for missed nuclei; lower
+nms_thresh for split/duplicate outlines, raise it for merged ones).
 
-The retry loop (`--pannuke-index` / `--pannuke-loop-n`) needs ground truth to
-score against, so it runs on PanNuke image(s) rather than an arbitrary
-`--image`. Each iteration is scored with real Panoptic Quality (PQ) against
-PanNuke's ground-truth instance mask -- not a Claude-judged 0-10 score -- and
-if PQ is below the acceptance bar, something proposes a revised StarDist
-threshold to retry with (there's no text prompt to revise, so the retry knob
-is `prob_thresh` / `nms_thresh` instead). By default that "something" is
-`propose_thresholds`, a free deterministic rule over the TP/FP/FN/mean-IoU
-breakdown -- no API key, no cost. Pass `--claude-feedback` to have Claude look
-at the outlined image and propose the revision instead (costs a small amount
-per call). See `compute_panoptic_quality`, `propose_thresholds`,
-`evaluate_result`, and `SCORING_RUBRIC` below for exactly what's computed and
-what's judged.
+When a PanNuke ground-truth instance mask is available (--pannuke-index),
+Panoptic Quality against it decides accept/reject instead of Claude's visual
+score, and Claude is only asked to propose threshold revisions -- same
+ground-truth-vs-visual-fallback split as agentic_countgd.py would face with
+an arbitrary --image and no known answer.
 
-`--image` and `--pannuke-n` remain single forward passes with no ground truth
-and no Claude evaluation loop -- an arbitrary user image has no annotated
-instance mask to compute PQ against.
-
-`--pannuke-n`/`--pannuke-index` pull images straight from the official
-PanNuke fold archive (https://warwick.ac.uk/fac/cross_fac/tia/data/pannuke/
-fold_{n}.zip) via HTTP range requests, decompressing only enough of the
-(large, DEFLATE-compressed) images.npy/masks.npy streams to cover the
-requested image(s) -- without downloading the full ~700MB-per-fold zip.
-Requires `fsspec`+`aiohttp` in addition to this script's other deps.
+manager_agent.py (this folder's Qwen-driven manager) imports from here --
+PRETRAINED_MODEL, run_stardist, load_image, load_pannuke_sample,
+compute_panoptic_quality, save_instance_outlines, best_entry, plus the
+per-class/diverse-selection additions for CellViT and train/test-split
+training (load_pannuke_sample_with_classes, load_pannuke_types,
+load_pannuke_samples, load_pannuke_samples_with_classes,
+select_diverse_indices, TISSUE_DIVERSITY_MAX_INDEX) -- and drives them with
+Qwen instead of Claude, the same way it does with agentic_countgd.py's
+run_countgd. Everything else in this file (the Claude orchestration, main())
+is this script's own standalone use, mirroring agentic_countgd.py.
 
 Usage:
-    python agentic_stardist.py --image tissue.png
-    python agentic_stardist.py --pannuke-n 10 --pannuke-fold 1
+    python agentic_stardist.py --image tissue.png --prompt "segment the individual nuclei"
     python agentic_stardist.py --pannuke-index 0 --pannuke-fold 1 --prompt "segment the individual nuclei"
-    python agentic_stardist.py --pannuke-loop-n 5 --pannuke-fold 1
 """
 import argparse
-import base64
-import contextlib
 import json
-import mimetypes
 import random
 import textwrap
-import zipfile
 from pathlib import Path
-from typing import Optional, Tuple, cast
 
-import anthropic # pyright: ignore[reportMissingImports]
-import fsspec # pyright: ignore[reportMissingImports]
-import matplotlib.pyplot as plt # pyright: ignore[reportMissingModuleSource]
-import numpy as np # pyright: ignore[reportMissingImports]
-import numpy.lib.format as npy_format # pyright: ignore[reportMissingImports]
-from csbdeep.utils import normalize # pyright: ignore[reportMissingImports]
-from matplotlib.backends.backend_pdf import PdfPages # pyright: ignore[reportMissingModuleSource]
-from PIL import Image # pyright: ignore[reportMissingImports]
-from stardist.models import StarDist2D # pyright: ignore[reportMissingImports]
+import anthropic
+import numpy as np
+from matplotlib import colormaps
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from PIL import Image
+from skimage.segmentation import find_boundaries
+from stardist.models import StarDist2D
 
-MODEL = "claude-opus-4-8"
-PRETRAINED_MODEL = "2D_versatile_he"
-MASK_NAME = "stardist_mask.npy"
-OVERLAY_NAME = "stardist_overlay.png"
-OUTLINES_NAME = "stardist_outlines.png"
+from agentic_countgd import MODEL, image_to_content_block
+
+PRETRAINED_MODEL = "2D_versatile_he"  # H&E-stained nuclei -- matches PanNuke's stain type
 PDF_NAME = "stardist_results.pdf"
-PANNUKE_FOLD_URL = "https://warwick.ac.uk/fac/cross_fac/tia/data/pannuke/fold_{fold}.zip"
-# PanNuke stores each fold as contiguous per-tissue blocks, and images.npy/masks.npy are
-# DEFLATE streams that can only be read sequentially from the start -- so the cost of
-# including a tissue in a sample is set by that tissue's *earliest* index in the fold.
-# In fold 1 (2656 images, 19 tissues), capping at 1500 still covers 17 of the 19 tissues
-# (only HeadNeck at 2098 and Liver at 2189 fall outside it) while reading ~56% of the fold
-# instead of the ~82% a full 19-tissue spread would need. See select_diverse_indices.
-TISSUE_DIVERSITY_MAX_INDEX = 1500
+ACCEPT_SCORE_THRESHOLD = 7   # Claude's own 0-10 visual score, used when there's no ground truth
+ACCEPT_PQ_THRESHOLD = 0.5    # acceptance bar when a ground-truth instance mask is available
+
+_pannuke_folds = {}  # fold -> loaded HF Dataset, cached so a training run doesn't reload it per-image
 
 
-ALLOWED_IMAGE_MIME_TYPES = ("image/jpeg", "image/png", "image/gif", "image/webp")
-
-
-def image_to_content_block(image_path: str):
-    mime_type, _ = mimetypes.guess_type(image_path)
-    if mime_type not in ALLOWED_IMAGE_MIME_TYPES:
-        mime_type = "image/png"
-    data = base64.standard_b64encode(Path(image_path).read_bytes()).decode("utf-8")
-    return {
-        "type": "image",
-        "source": {"type": "base64", "media_type": mime_type, "data": data},
-    }
-
-
-def load_image(image_path: str) -> np.ndarray:
-    """Load an RGB image as a numpy array (the H&E model expects 3-channel RGB)."""
+def load_image(image_path) -> np.ndarray:
     return np.array(Image.open(image_path).convert("RGB"))
 
 
-def unique_path(path: Path) -> Path:
-    """Return `path` unchanged if nothing exists there yet; otherwise append _1, _2, ...
-    before the suffix until a free name is found, so a re-run never silently overwrites
-    a previous PDF report."""
-    if not path.exists():
-        return path
-    n = 1
-    while True:
-        candidate = path.with_name(f"{path.stem}_{n}{path.suffix}")
-        if not candidate.exists():
-            return candidate
-        n += 1
-
-
-def _read_exact(fp, total_bytes: int, chunk_size: int = 4 * 1024 * 1024) -> bytes:
-    """Read exactly total_bytes from fp in bounded chunks rather than one giant .read()
-    call. A single very large read becomes one huge HTTP range request under fsspec's
-    HTTP filesystem, and PanNuke's server tends to drop the connection mid-transfer past
-    a few hundred MB; smaller chunks keep each underlying request reliable."""
-    chunks = []
-    remaining = total_bytes
-    while remaining > 0:
-        chunk = fp.read(min(chunk_size, remaining))
-        if not chunk:
-            raise IOError(f"unexpected EOF: read {total_bytes - remaining} of {total_bytes} bytes")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-
-def _read_npy_header(fp):
-    version = npy_format.read_magic(fp)
-    if version == (1, 0):
-        return npy_format.read_array_header_1_0(fp)
-    return npy_format.read_array_header_2_0(fp)
-
-
-def _read_array_prefix(zf: zipfile.ZipFile, member: str, n: int, retries: int = 4) -> tuple:
-    """Open a zip member, read its .npy header, then read exactly the first n items of
-    the array body. PanNuke's server drops the connection mid-transfer often enough
-    (independent of request size -- even single ~5MB chunks fail) that this retries by
-    re-opening the member from scratch each time: a failed read leaves the DEFLATE
-    decompressor mid-stream, so resuming in place isn't an option. Returns (raw_bytes,
-    shape, dtype) for the full array; caller reshapes to (n,) + shape[1:]."""
-    last_exc = None
-    for attempt in range(1, retries + 1):
-        try:
-            with zf.open(member) as fp:
-                shape, _, dtype = _read_npy_header(fp)
-                per_item_bytes = int(np.prod(shape[1:])) * dtype.itemsize if len(shape) > 1 else dtype.itemsize
-                raw = _read_exact(fp, n * per_item_bytes)
-                return raw, shape, dtype
-        except Exception as exc:
-            last_exc = exc
-            print(f"  [retry {attempt}/{retries}] read of {member} dropped ({exc}); reopening and retrying...")
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError(f"Failed to read {member}: retries={retries}")
-
-
-PANNUKE_HTTP_BLOCK_SIZE = 512 * 1024
-
-
-@contextlib.contextmanager
-def _open_pannuke_zip(fold: int, block_size: int | None = None):
-    """Passes the fsspec HTTP file handle straight to zipfile.ZipFile instead of calling
-    fp.read() to materialize it into an in-memory buffer first -- zipfile only seeks/reads
-    the central directory plus whatever members are actually opened, so this never downloads
-    the full ~700MB+ zip (confirmed: listing members + reading types.npy this way takes
-    under 4s). An earlier version here called fp.read() unconditionally, which *did* pull
-    the entire remote zip into memory with no retry around it -- that unbounded whole-file
-    read, not the per-block HTTP chunk size, is what was actually producing FSTimeoutError
-    (fp.read() has no size limit, so one dropped connection anywhere across a many-hundred-MB
-    transfer aborted the whole thing). block_size still controls the chunk size of the range
-    requests zipfile issues internally when reading a member.
-    Context manager so the underlying fsspec HTTP handle (which ZipFile.close() does not
-    close, since it didn't open the path itself) always gets closed too."""
-    with fsspec.open(PANNUKE_FOLD_URL.format(fold=fold), mode="rb", block_size=block_size) as fp:  # type: ignore[assignment]
-        zf = zipfile.ZipFile(fp)  # type: ignore[arg-type]
-        try:
-            yield zf
-        finally:
-            zf.close()
-
-
-def load_pannuke_images(fold: int, n: int):
-    """Fetch just the first n images (+ tissue labels) from an official PanNuke
-    fold archive via HTTP range requests: only enough of the DEFLATE-compressed
-    images.npy/types.npy streams is decompressed to cover n images, so this
-    never downloads the full ~700MB zip."""
-    with _open_pannuke_zip(fold, block_size=PANNUKE_HTTP_BLOCK_SIZE) as zf:
-        with zf.open(f"Fold {fold}/images/fold{fold}/types.npy") as tf:
-            _, _, dtype = _read_npy_header(tf)
-            types = np.frombuffer(tf.read(n * dtype.itemsize), dtype=dtype)[:n]
-
-        raw, shape, dtype = _read_array_prefix(zf, f"Fold {fold}/images/fold{fold}/images.npy", n)
-        images = np.frombuffer(raw, dtype=dtype).reshape((n,) + shape[1:])
-
-    return images.astype(np.uint8), [str(t) for t in types]
-
-
-def load_pannuke_types(fold: int) -> list:
-    """Fetch every image's tissue-type label for a fold in one shot -- types.npy is a few
-    KB, independent of the multi-GB images.npy/masks.npy streams, so this lets diverse
-    sampling see the whole fold's tissue layout without paying for image/mask data."""
-    with _open_pannuke_zip(fold, block_size=PANNUKE_HTTP_BLOCK_SIZE) as zf:
-        with zf.open(f"Fold {fold}/images/fold{fold}/types.npy") as tf:
-            _, _, dtype = _read_npy_header(tf)
-            types = np.frombuffer(tf.read(), dtype=dtype)
-    return [str(t) for t in types]
-
-
-def select_diverse_indices(
-    types: list, n: int, max_index: int | None = None, seed: int = 0, split: str = "all",
-) -> list:
-    """Pick n indices spanning as many distinct tissue types as possible instead of the
-    first n (which in PanNuke is a single contiguous tissue block). max_index bounds how
-    deep into the fold to look (see TISSUE_DIVERSITY_MAX_INDEX) -- a tissue whose earliest
-    occurrence falls beyond it is simply unavailable to this sample. Round-robins through
-    tissues in shuffled order (seeded for reproducibility), taking one index per tissue per
-    pass, so the result isn't dominated by whichever tissue has the biggest block. Returns
-    indices sorted ascending (the order they'll need to be read from the fold in anyway).
-
-    split: "all" (default, original behavior), "train", or "test" -- same idea as
-    bbbc005.load_bbbc005_samples's split parameter: partitions the candidate index pool by
-    parity (even -> train, odd -> test) before the diverse-tissue selection runs, so train/test
-    never share an image regardless of n on either side, while both halves still see the same
-    tissue-type diversity (PanNuke stores contiguous per-tissue blocks, so alternating parity
-    within a block -- not splitting low-half/high-half -- keeps both halves representative of
-    each tissue rather than one half seeing only that tissue's first occurrences)."""
-    by_tissue = {}
-    limit = len(types) if max_index is None else min(max_index + 1, len(types))
-    if split == "train":
-        candidate_indices = range(0, limit, 2)
-    elif split == "test":
-        candidate_indices = range(1, limit, 2)
-    elif split == "all":
-        candidate_indices = range(limit)
-    else:
-        raise ValueError(f"split must be 'all', 'train', or 'test', got {split!r}")
-    for i in candidate_indices:
-        by_tissue.setdefault(types[i], []).append(i)
-
-    tissue_order = list(by_tissue.keys())
-    random.Random(seed).shuffle(tissue_order)
-
-    selected = []
-    pass_num = 0
-    while len(selected) < n:
-        added_this_pass = False
-        for tissue in tissue_order:
-            if len(selected) >= n:
-                break
-            pool = by_tissue[tissue]
-            if pass_num < len(pool):
-                selected.append(pool[pass_num])
-                added_this_pass = True
-        if not added_this_pass:
-            break
-        pass_num += 1
-
-    return sorted(selected)
-
-
-def pannuke_mask_to_instance_labels(mask: np.ndarray) -> np.ndarray:
-    """Dataset-specific loader: convert PanNuke's raw mask format into the standard
-    label-mask format compute_panoptic_quality expects (see its docstring). Unions
-    PanNuke's 5 per-class instance-ID channels (0=Neoplastic, 1=Inflammatory,
-    2=Connective, 3=Dead, 4=Epithelial; channel 5 is background, dropped) into one
-    instance-ID label image. Each channel numbers its own instances 1..k independently,
-    so IDs are reassigned to stay unique across the combined image.
-
-    A loader for another dataset would live here as its own function, ending in this
-    same standard format -- compute_panoptic_quality itself has no PanNuke-specific
-    knowledge and doesn't need to change."""
-    combined = np.zeros(mask.shape[:2], dtype=np.int32)
-    next_id = 1
-    for c in range(5):
-        channel = mask[..., c]
-        for inst_id in np.unique(channel):
-            if inst_id == 0:
-                continue
-            combined[channel == inst_id] = next_id
-            next_id += 1
-    return combined
-
-
-def load_pannuke_samples(fold: int, n: int):
-    """Fetch the first n images + ground-truth instance masks (+ tissue labels) from an
-    official PanNuke fold archive in one pass: extends load_pannuke_images with masks.npy,
-    reusing the same partial-DEFLATE-decompression trick so this never downloads the full
-    ~700MB zip. Returns (images, gt_labels_list, tissue_labels); gt_labels_list is already
-    in the standard label-mask format (see pannuke_mask_to_instance_labels)."""
-    with _open_pannuke_zip(fold) as zf:
-        with zf.open(f"Fold {fold}/images/fold{fold}/types.npy") as tf:
-            _, _, dtype = _read_npy_header(tf)
-            types = np.frombuffer(tf.read(n * dtype.itemsize), dtype=dtype)[:n]
-
-        raw, shape, dtype = _read_array_prefix(zf, f"Fold {fold}/images/fold{fold}/images.npy", n)
-        images = np.frombuffer(raw, dtype=dtype).reshape((n,) + shape[1:]).astype(np.uint8)
-
-        raw, shape, dtype = _read_array_prefix(zf, f"Fold {fold}/masks/fold{fold}/masks.npy", n)
-        masks = np.frombuffer(raw, dtype=dtype).reshape((n,) + shape[1:])
-
-    gt_labels_list = [pannuke_mask_to_instance_labels(masks[i]) for i in range(n)]
-    return images, gt_labels_list, [str(t) for t in types]
-
-
-def load_pannuke_sample(fold: int, index: int):
-    """Fetch a single image + ground-truth instance mask (+ tissue label) at `index`."""
-    images, gt_labels_list, tissue_labels = load_pannuke_samples(fold, index + 1)
-    return images[-1], gt_labels_list[-1], tissue_labels[-1]
-
-
-# Class names duplicated here as a literal, not imported from agentic_cellvit.NUCLEI_CLASSES --
-# importing agentic_cellvit would pull torch into this process, which only has TensorFlow
-# loaded (see manager_agent.py's StardistWorker docstring for why torch and TensorFlow/ROCm
-# can't coexist here).
-PANNUKE_CLASS_NAMES = ["Neoplastic", "Inflammatory", "Connective", "Dead", "Epithelial"]
-
-
-def pannuke_class_counts(mask: np.ndarray) -> dict:
-    """Per-class true instance counts from one raw PanNuke mask -- unlike
-    pannuke_mask_to_instance_labels, which unions all 5 class channels into one class-agnostic
-    instance mask for StarDist's own PQ scoring, this keeps each class's count separate, for
-    CellViT's per-class ground truth."""
-    counts = {}
-    for c, name in enumerate(PANNUKE_CLASS_NAMES):
-        channel = mask[..., c]
-        counts[name] = int(len(np.unique(channel)) - (1 if 0 in channel else 0))
-    return counts
-
-
-def pannuke_class_instance_labels(mask: np.ndarray) -> dict:
-    """Per-class raw instance-label arrays from one raw PanNuke mask -- each of mask's first 5
-    channels is already, individually, in compute_panoptic_quality's expected standard
-    label-mask format (2D int array, background=0, unique positive instance IDs), so this is
-    just a per-class split with no extra work, for scoring CellViT's per-class predictions."""
-    return {name: mask[..., c] for c, name in enumerate(PANNUKE_CLASS_NAMES)}
-
-
-def load_pannuke_samples_with_classes(fold: int, n: int):
-    """Sibling to load_pannuke_samples, additionally returning per-image per-class ground
-    truth (pannuke_class_counts, pannuke_class_instance_labels) for CellViT -- a new function
-    rather than changing load_pannuke_samples's return shape, since existing callers already
-    unpack its fixed 3-tuple."""
-    with _open_pannuke_zip(fold) as zf:
-        with zf.open(f"Fold {fold}/images/fold{fold}/types.npy") as tf:
-            _, _, dtype = _read_npy_header(tf)
-            types = np.frombuffer(tf.read(n * dtype.itemsize), dtype=dtype)[:n]
-
-        raw, shape, dtype = _read_array_prefix(zf, f"Fold {fold}/images/fold{fold}/images.npy", n)
-        images = np.frombuffer(raw, dtype=dtype).reshape((n,) + shape[1:]).astype(np.uint8)
-
-        raw, shape, dtype = _read_array_prefix(zf, f"Fold {fold}/masks/fold{fold}/masks.npy", n)
-        masks = np.frombuffer(raw, dtype=dtype).reshape((n,) + shape[1:])
-
-    class_counts_list = [pannuke_class_counts(masks[i]) for i in range(n)]
-    class_labels_list = [pannuke_class_instance_labels(masks[i]) for i in range(n)]
-    return images, class_counts_list, class_labels_list, [str(t) for t in types]
-
-
-def load_pannuke_sample_with_classes(fold: int, index: int):
-    """Fetch a single image + per-class ground truth (+ tissue label) at `index` --
-    single-sample counterpart to load_pannuke_samples_with_classes, mirroring
-    load_pannuke_sample's relationship to load_pannuke_samples."""
-    images, class_counts_list, class_labels_list, tissue_labels = load_pannuke_samples_with_classes(fold, index + 1)
-    return images[-1], class_counts_list[-1], class_labels_list[-1], tissue_labels[-1]
-
-
-def run_stardist(
-    model: StarDist2D, image: np.ndarray, prob_thresh: Optional[float] = None, nms_thresh: Optional[float] = None
-) -> Tuple[np.ndarray, dict]:
-    """One StarDist forward pass: normalize the image, predict instance labels.
-
-    prob_thresh/nms_thresh default to the model's own tuned values (None). predict_instances
-    is implemented as a wrapped generator internally (stardist/models/base.py) that yields
-    progress markers ('predict', 'tile', 'nms') before its real result -- Pyright's inference
-    picks up that whole union of yielded types, even though with return_predict=False (the
-    default, used here) it always actually returns the (labels, details) tuple at runtime."""
-    normalized = normalize(image, 1, 99.8, axis=(0, 1))
-    labels, details = cast(
-        Tuple[np.ndarray, dict],
-        model.predict_instances(normalized, prob_thresh=prob_thresh, nms_thresh=nms_thresh),
+def run_stardist(model: StarDist2D, image: np.ndarray, prob_thresh: float, nms_thresh: float):
+    """One StarDist2D call: normalized image -> (labels, details). labels is a
+    2D int array (0 = background, 1..N = one integer per detected nucleus)."""
+    from csbdeep.utils import normalize
+    labels, details = model.predict_instances(
+        normalize(image), prob_thresh=prob_thresh, nms_thresh=nms_thresh
     )
     return labels, details
 
 
+def _get_pannuke_fold(fold: int):
+    if fold not in _pannuke_folds:
+        from datasets import load_dataset
+        _pannuke_folds[fold] = load_dataset("RationAI/PanNuke", split=f"fold{fold}")
+    return _pannuke_folds[fold]
+
+
+def load_pannuke_sample(fold: int, index: int):
+    """Pull one PanNuke sample: the H&E image, a StarDist-style instance-label
+    mask built from PanNuke's per-nucleus binary masks (each nucleus is its
+    own binary image in the 'instances' field -- painted here into a single
+    2D array with one integer id per nucleus), and the tissue type name."""
+    dataset = _get_pannuke_fold(fold)
+    row = dataset[index]
+
+    image = np.array(row["image"].convert("RGB"))
+    labels = np.zeros(image.shape[:2], dtype=np.int32)
+    for instance_id, mask in enumerate(row["instances"], start=1):
+        labels[np.array(mask) > 0] = instance_id
+
+    tissue = dataset.features["tissue"].int2str(row["tissue"])
+    return image, labels, tissue
+
+
+def load_pannuke_samples(fold: int, count: int):
+    """Batched counterpart to load_pannuke_sample -- loads samples 0..count-1 from a fold in one
+    call. Reuses load_pannuke_sample per row rather than duplicating its instance-mask painting
+    logic; the actual win here isn't per-row cost but that _get_pannuke_fold's cache means the
+    underlying HF dataset itself is only ever loaded once, regardless of how many times this or
+    load_pannuke_sample is called afterward. Returns (images, gt_labels, tissues), each a list of
+    length count, aligned by index -- manager_agent.py's diverse-index selection then subsets
+    these lists by whichever specific indices it actually wants."""
+    images, gt_labels, tissues = [], [], []
+    for i in range(count):
+        image, labels, tissue = load_pannuke_sample(fold, i)
+        images.append(image)
+        gt_labels.append(labels)
+        tissues.append(tissue)
+    return images, gt_labels, tissues
+
+
+def _pannuke_category_names(dataset) -> list:
+    """PanNuke's 'categories' field is a Sequence(ClassLabel) aligned index-for-index with
+    'instances' -- one class id per nucleus. Confirmed via the RationAI/PanNuke dataset schema:
+    ["Neoplastic", "Inflammatory", "Connective", "Dead", "Epithelial"], the same standard
+    ordering agentic_cellvit.NUCLEI_CLASSES already uses."""
+    return dataset.features["categories"].feature.names
+
+
+def pannuke_class_counts(row, dataset) -> dict:
+    """Per-class true nucleus counts for one PanNuke row -- {class_name: int count} -- the
+    ground_truth_counts_by_type shape run_cellvit_with_feedback's dossier/decision functions
+    expect."""
+    class_names = _pannuke_category_names(dataset)
+    counts = {name: 0 for name in class_names}
+    for cat_id in row["categories"]:
+        counts[class_names[cat_id]] += 1
+    return counts
+
+
+def pannuke_class_instance_labels(row, dataset) -> dict:
+    """Per-class instance-label masks for one PanNuke row -- {class_name: (H, W) int32 ndarray},
+    one array per class, each with its own independent 1..N instance numbering -- already in
+    compute_panoptic_quality's expected standard label-mask format (see
+    _stardist_worker_score_cellvit_predictions in manager_agent.py, which scores CellViT's
+    per-class predictions against exactly this)."""
+    class_names = _pannuke_category_names(dataset)
+    image_shape = np.array(row["image"]).shape[:2]
+    labels_by_class = {name: np.zeros(image_shape, dtype=np.int32) for name in class_names}
+    next_id = {name: 1 for name in class_names}
+    for mask, cat_id in zip(row["instances"], row["categories"]):
+        name = class_names[cat_id]
+        labels_by_class[name][np.array(mask) > 0] = next_id[name]
+        next_id[name] += 1
+    return labels_by_class
+
+
+def load_pannuke_sample_with_classes(fold: int, index: int):
+    """CellViT counterpart to load_pannuke_sample -- same image/tissue, but per-class ground
+    truth (pannuke_class_counts/pannuke_class_instance_labels) instead of one class-agnostic
+    instance mask, since CellViT scores per pathology type, not just object count. Returns
+    (image, ground_truth_counts_by_type, ground_truth_class_labels, tissue)."""
+    dataset = _get_pannuke_fold(fold)
+    row = dataset[index]
+    image = np.array(row["image"].convert("RGB"))
+    counts = pannuke_class_counts(row, dataset)
+    labels_by_class = pannuke_class_instance_labels(row, dataset)
+    tissue = dataset.features["tissue"].int2str(row["tissue"])
+    return image, counts, labels_by_class, tissue
+
+
+def load_pannuke_samples_with_classes(fold: int, count: int):
+    """Batched counterpart to load_pannuke_sample_with_classes, same relationship as
+    load_pannuke_samples has to load_pannuke_sample. Returns (images, class_counts, class_labels,
+    tissues), each a list of length count, aligned by index."""
+    images, class_counts, class_labels, tissues = [], [], [], []
+    for i in range(count):
+        image, counts, labels_by_class, tissue = load_pannuke_sample_with_classes(fold, i)
+        images.append(image)
+        class_counts.append(counts)
+        class_labels.append(labels_by_class)
+        tissues.append(tissue)
+    return images, class_counts, class_labels, tissues
+
+
+def load_pannuke_types(fold: int) -> list:
+    """Tissue-type name for every index in a fold, without loading any images -- used by
+    select_diverse_indices to search for tissue diversity cheaply before deciding which (few)
+    indices to actually load via load_pannuke_samples/load_pannuke_samples_with_classes."""
+    dataset = _get_pannuke_fold(fold)
+    tissue_feature = dataset.features["tissue"]
+    return [tissue_feature.int2str(t) for t in dataset["tissue"]]
+
+
+# Caps how many of a fold's indices select_diverse_indices will even consider, so the caller's
+# downstream batched load (load_pannuke_samples(fold, selected[-1] + 1) -- a prefix load from
+# index 0 through the largest selected index) stays bounded regardless of how large the full
+# fold is. Diversity across tissue types is what's being optimized for here, not literally every
+# index being reachable, so this only needs to comfortably cover a few thousand candidates --
+# select_diverse_indices itself clamps to min(max_index, len(all_types)), so this being larger
+# than any given fold's actual size is harmless.
+TISSUE_DIVERSITY_MAX_INDEX = 2000
+
+
+def select_diverse_indices(all_types: list, n: int, max_index: int, seed: int = 0, split: str = "all") -> list:
+    """Picks up to n indices from all_types (tissue-type name per dataset index, from
+    load_pannuke_types), spread across as many distinct tissue types as possible via
+    round-robin, instead of the first n (a single contiguous tissue block covering at most one
+    or two tissue types). Only considers indices < max_index (see TISSUE_DIVERSITY_MAX_INDEX).
+
+    split ("all"/"train"/"test") partitions candidate indices by parity (even/odd) before
+    selection -- same idea as bbbc005.load_bbbc005_samples's split parameter for CountGD --
+    guaranteeing train and test never share an index regardless of n on either side.
+
+    Returns indices sorted ascending -- callers rely on this to treat selected[-1] as the
+    batch's own upper bound for a prefix load."""
+    candidate_indices = list(range(min(max_index, len(all_types))))
+    if split == "train":
+        candidate_indices = candidate_indices[0::2]
+    elif split == "test":
+        candidate_indices = candidate_indices[1::2]
+    elif split != "all":
+        raise ValueError(f"split must be 'all', 'train', or 'test', got {split!r}")
+
+    by_type: dict = {}
+    for idx in candidate_indices:
+        by_type.setdefault(all_types[idx], []).append(idx)
+    rng = random.Random(seed)
+    for indices in by_type.values():
+        rng.shuffle(indices)
+
+    selected = []
+    type_names = sorted(by_type)  # stable order across calls given the same underlying data
+    round_num = 0
+    while len(selected) < n:
+        added_this_round = False
+        for name in type_names:
+            if round_num < len(by_type[name]):
+                selected.append(by_type[name][round_num])
+                added_this_round = True
+                if len(selected) == n:
+                    break
+        if not added_this_round:
+            break  # every tissue type's candidates within max_index/split are exhausted
+        round_num += 1
+    return sorted(selected)
+
+
+def best_entry(history: list) -> dict:
+    """Picks the history entry with the highest pq -- pure logic, no I/O, kept here alongside
+    compute_panoptic_quality since callers already import PQ-scoring machinery from this module
+    rather than duplicating a second "which iteration was best" rule elsewhere."""
+    return max(history, key=lambda e: e["pq"])
+
+
 def compute_panoptic_quality(pred_labels: np.ndarray, gt_labels: np.ndarray, iou_threshold: float = 0.5) -> dict:
-    """PQ = (mean IoU of matched instance pairs) x (TP / (TP + 0.5*FP + 0.5*FN)).
+    """Standard Panoptic Quality (Kirillov et al., 'Panoptic Segmentation'):
+    PQ = (sum of IoU over matched pairs) / (TP + 0.5*FP + 0.5*FN), where a
+    match is any (pred, gt) pair with IoU > iou_threshold. At threshold > 0.5,
+    a predicted instance can match at most one ground-truth instance (and
+    vice versa) as long as neither label set has overlapping instances with
+    itself -- true here, since both are single-label segmentations -- so a
+    greedy scan finds the same matching an assignment algorithm would."""
+    pred_ids = np.unique(pred_labels)
+    pred_ids = pred_ids[pred_ids != 0]
+    gt_ids = np.unique(gt_labels)
+    gt_ids = gt_ids[gt_ids != 0]
 
-    Dataset-agnostic: pred_labels and gt_labels must both be in the standard label-mask
-    format -- a 2D int array, same shape, background=0, each instance a unique positive
-    ID (1..K). Neither array needs to come from any particular dataset; a loader that
-    produces this format (e.g. pannuke_mask_to_instance_labels) is all a new ground-truth
-    source needs to plug in here.
+    if len(gt_ids) == 0 and len(pred_ids) == 0:
+        return {"pq": 1.0, "mean_iou": 1.0, "tp": 0, "fp": 0, "fn": 0}
 
-    Predicted and ground-truth instances are matched by taking, for each ground-truth
-    instance, the overlapping predicted instance with highest IoU. A match only counts
-    if that IoU >= iou_threshold; at threshold 0.5 this greedy matching is automatically
-    one-to-one (two disjoint instances can't both exceed 50% overlap with the same other
-    instance), so no separate assignment/optimization step is needed."""
-    pred_ids = [i for i in np.unique(pred_labels) if i != 0]
-    gt_ids = [i for i in np.unique(gt_labels) if i != 0]
+    max_pred = int(pred_labels.max()) + 1
+    max_gt = int(gt_labels.max()) + 1
+    joint = pred_labels.astype(np.int64) * max_gt + gt_labels.astype(np.int64)
+    counts = np.bincount(joint.ravel(), minlength=max_pred * max_gt).reshape(max_pred, max_gt)
+    pred_areas = np.bincount(pred_labels.ravel(), minlength=max_pred)
+    gt_areas = np.bincount(gt_labels.ravel(), minlength=max_gt)
 
-    matched_ious = []
-    matched_pred_ids = set()
-    for gt_id in gt_ids:
-        gt_mask = gt_labels == gt_id
-        best_iou, best_pred_id = 0.0, None
-        for pred_id in np.unique(pred_labels[gt_mask]):
-            if pred_id == 0:
+    matched_iou_sum = 0.0
+    tp = 0
+    matched_gt, matched_pred = set(), set()
+    for p in pred_ids:
+        for g in gt_ids:
+            intersection = counts[p, g]
+            if intersection == 0:
                 continue
-            pred_mask = pred_labels == pred_id
-            intersection = np.count_nonzero(gt_mask & pred_mask)
-            union = np.count_nonzero(gt_mask | pred_mask)
-            iou = intersection / union if union else 0.0
-            if iou > best_iou:
-                best_iou, best_pred_id = iou, pred_id
-        if best_pred_id is not None and best_iou >= iou_threshold:
-            matched_ious.append(best_iou)
-            matched_pred_ids.add(best_pred_id)
+            union = pred_areas[p] + gt_areas[g] - intersection
+            iou = intersection / union
+            if iou > iou_threshold:
+                tp += 1
+                matched_iou_sum += iou
+                matched_pred.add(p)
+                matched_gt.add(g)
+                break
 
-    tp = len(matched_ious)
-    fp = len(pred_ids) - len(matched_pred_ids)
-    fn = len(gt_ids) - tp
-    mean_iou = sum(matched_ious) / tp if tp else 0.0
+    fp = len(pred_ids) - len(matched_pred)
+    fn = len(gt_ids) - len(matched_gt)
+    mean_iou = matched_iou_sum / tp if tp else 0.0
     denom = tp + 0.5 * fp + 0.5 * fn
-    pq = mean_iou * (tp / denom) if denom else 1.0
-
-    return {"pq": pq, "mean_iou": mean_iou, "tp": tp, "fp": fp, "fn": fn}
-
-
-def save_overlay(image: np.ndarray, labels: np.ndarray, overlay_path: Path) -> None:
-    from skimage.color import label2rgb # pyright: ignore[reportMissingImports]
-    overlay = label2rgb(labels, image=image, bg_label=0)
-    Image.fromarray((overlay * 255).astype(np.uint8)).save(overlay_path)
+    pq = matched_iou_sum / denom if denom else 0.0
+    # Cast off numpy scalar types (float64/bool) before this leaves the function --
+    # comparing a numpy float downstream (e.g. pq_result["pq"] >= ACCEPT_PQ_THRESHOLD)
+    # produces numpy.bool, which json.dumps can't serialize, unlike a real Python bool.
+    return {"pq": round(float(pq), 4), "mean_iou": round(float(mean_iou), 4), "tp": tp, "fp": fp, "fn": fn}
 
 
-def save_instance_outlines(image: np.ndarray, labels: np.ndarray, outlines_path: Path) -> None:
-    """Draw each nucleus's boundary over the original image, one distinct color per instance ID."""
-    import matplotlib as mpl # pyright: ignore[reportMissingModuleSource]
-    from skimage.segmentation import find_boundaries # pyright: ignore[reportMissingImports]
+def save_instance_outlines(image: np.ndarray, labels: np.ndarray, saved_path) -> None:
+    """Draw each instance's boundary in a distinct color over the original
+    image and save as PNG -- the annotated image Claude/Qwen evaluates each
+    iteration, and the final result image shown in the PDF report."""
+    height, width = image.shape[:2]
+    fig, ax = plt.subplots(figsize=(width / 100, height / 100), dpi=100)
+    ax.imshow(image)
+    ax.axis("off")
 
-    num_instances = int(labels.max())
-    outlined = image.copy()
-    colormap = mpl.colormaps["hsv"].resampled(max(num_instances, 1))
+    instance_ids = [i for i in np.unique(labels) if i != 0]
+    cmap = colormaps["hsv"].resampled(max(len(instance_ids), 1))
+    for idx, instance_id in enumerate(instance_ids):
+        ys, xs = np.nonzero(find_boundaries(labels == instance_id, mode="inner"))
+        ax.scatter(xs, ys, s=1, color=cmap(idx), marker=".")
 
-    for instance_id in range(1, num_instances + 1):
-        boundary = find_boundaries(labels == instance_id, mode="outer")
-        color = (np.array(colormap(instance_id - 1)[:3]) * 255).astype(np.uint8)
-        outlined[boundary] = color
+    fig.tight_layout(pad=0)
+    fig.savefig(saved_path, dpi=100)
+    plt.close(fig)
 
-    Image.fromarray(outlined).save(outlines_path)
-    
 
 def evaluate_result(
-    claude: anthropic.Anthropic,
-    user_prompt: str,
-    prob_thresh: float,
-    nms_thresh: float,
-    pq_result: dict,
-    outlines_image_path: str,
-    history: list,
+    claude: anthropic.Anthropic, task_description: str, prob_thresh: float, nms_thresh: float,
+    predicted_count: int, outlines_image_path: str, history: list,
 ) -> dict:
-    """Only called when PQ is below ACCEPT_PQ_THRESHOLD -- Claude doesn't decide accept/reject
-    (that's computed directly from ground truth), it only proposes what to try next."""
+    """No ground truth available -- Claude both scores (0-10) and decides accept/reject by eye."""
     response = claude.messages.create(
         model=MODEL,
         max_tokens=4096,
@@ -474,11 +330,13 @@ def evaluate_result(
                 "schema": {
                     "type": "object",
                     "properties": {
+                        "accept": {"type": "boolean"},
+                        "score": {"type": "integer"},
                         "feedback": {"type": "string"},
                         "revised_prob_thresh": {"type": ["number", "null"]},
                         "revised_nms_thresh": {"type": ["number", "null"]},
                     },
-                    "required": ["feedback", "revised_prob_thresh", "revised_nms_thresh"],
+                    "required": ["accept", "score", "feedback", "revised_prob_thresh", "revised_nms_thresh"],
                     "additionalProperties": False,
                 },
             }
@@ -486,9 +344,62 @@ def evaluate_result(
         messages=[{
             "role": "user",
             "content": [
-                image_to_content_block(outlines_image_path),  # type: ignore
+                image_to_content_block(outlines_image_path),
                 {"type": "text", "text": (
-                    f"Original user request: \"{user_prompt}\"\n"
+                    f"Original user request: \"{task_description}\"\n"
+                    f"StarDist ran with prob_thresh={prob_thresh:.3f}, nms_thresh={nms_thresh:.3f}\n"
+                    f"Detected nuclei: {predicted_count}\n"
+                    f"Prior attempts this session: {json.dumps(history)}\n\n"
+                    "The attached image shows the original tissue with each StarDist-detected "
+                    "nucleus outlined in a distinct color. Evaluate: (1) do the outlines look "
+                    "visually accurate (no obvious missed nuclei, false positives, or merged/"
+                    "split instances)? (2) is the nucleus count plausible for what's shown? "
+                    "(3) does this satisfy the user's original request?\n"
+                    "Score 0-10. If score < 7, propose revised threshold(s): raise prob_thresh "
+                    "if you see false-positive outlines on background/noise, lower it if real "
+                    "nuclei look missed; lower nms_thresh if you see duplicate/split outlines "
+                    "around one nucleus, raise it if adjacent distinct nuclei look merged into "
+                    "one outline. Only set the threshold(s) that address the problem -- leave "
+                    "the other null. Otherwise set accept=true and leave both revised fields null."
+                )},
+            ],
+        }],
+    )
+    text = next(b.text for b in response.content if b.type == "text")
+    return json.loads(text)
+
+
+def propose_threshold_revision(
+    claude: anthropic.Anthropic, task_description: str, prob_thresh: float, nms_thresh: float,
+    pq_result: dict, outlines_image_path: str, history: list,
+) -> dict:
+    """Ground truth available -- PQ decides accept/reject (see main()); Claude
+    is only asked to propose better thresholds, not to judge the result."""
+    response = claude.messages.create(
+        model=MODEL,
+        max_tokens=4096,
+        thinking={"type": "adaptive"},
+        output_config={
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "revised_prob_thresh": {"type": ["number", "null"]},
+                        "revised_nms_thresh": {"type": ["number", "null"]},
+                        "feedback": {"type": "string"},
+                    },
+                    "required": ["revised_prob_thresh", "revised_nms_thresh", "feedback"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        messages=[{
+            "role": "user",
+            "content": [
+                image_to_content_block(outlines_image_path),
+                {"type": "text", "text": (
+                    f"Original user request: \"{task_description}\"\n"
                     f"StarDist ran with prob_thresh={prob_thresh:.3f}, nms_thresh={nms_thresh:.3f}\n"
                     f"Panoptic Quality against ground truth: PQ={pq_result['pq']:.3f} "
                     f"(below the {ACCEPT_PQ_THRESHOLD} acceptance bar)\n"
@@ -497,261 +408,38 @@ def evaluate_result(
                     f"Prior attempts this session: {json.dumps(history)}\n\n"
                     "The attached image shows the original tissue with each StarDist-detected "
                     "nucleus outlined in a distinct color. FP = spurious detections with no "
-                    "matching ground-truth nucleus; FN = ground-truth nuclei StarDist missed; "
-                    "a low mean IoU on matched pairs means boundaries are poorly aligned or "
+                    "matching ground-truth nucleus; FN = ground-truth nuclei StarDist missed; a "
+                    "low mean IoU on matched pairs means boundaries are poorly aligned or "
                     "instances are being split/merged. Using both these numbers and the image, "
-                    "propose revised threshold(s) to reduce the error:\n"
-                    "  - prob_thresh (0-1): the minimum detection confidence. Raise it if FP is "
-                    "high (background/noise outlined as nuclei); lower it if FN is high (real "
-                    "nuclei missed).\n"
-                    "  - nms_thresh (0-1): how much overlap is tolerated between candidate "
-                    "detections before one is suppressed. Lower it if you see duplicate/split "
-                    "outlines around one nucleus; raise it if adjacent distinct nuclei look "
-                    "merged into a single outline.\n"
-                    "Only set the threshold(s) that address the problem the numbers and image "
-                    "point to -- leave the other null to keep its current value."
+                    "propose revised threshold(s):\n"
+                    "  - prob_thresh (0-1): raise it if FP is high, lower it if FN is high.\n"
+                    "  - nms_thresh (0-1): lower it if you see duplicate/split outlines around "
+                    "one nucleus; raise it if adjacent distinct nuclei look merged into a single "
+                    "outline.\n"
+                    "Only set the threshold(s) that address the problem -- leave the other null."
                 )},
             ],
         }],
     )
-    text_blocks = [b.text for b in response.content if b.type == "text"]
-    if not text_blocks:
-        raise RuntimeError(
-            f"Claude returned no text content (stop_reason={response.stop_reason!r}); "
-            "cannot parse a threshold-revision suggestion."
-        )
-    return json.loads(text_blocks[0])
+    text = next(b.text for b in response.content if b.type == "text")
+    return json.loads(text)
 
-
-ACCEPT_PQ_THRESHOLD = 0.5
 
 SCORING_RUBRIC = (
-    "Each iteration is scored with Panoptic Quality (PQ) against PanNuke's ground-truth\n"
-    "instance mask:\n\n"
-    "    PQ = (mean IoU of matched instance pairs) x (TP / (TP + 0.5*FP + 0.5*FN))\n\n"
-    "Predicted and ground-truth instances are matched by IoU >= 0.5 (this threshold makes\n"
-    "matching automatically one-to-one, since two disjoint instances can't both exceed 50%\n"
-    "overlap with the same other instance). TP = matched pairs, FP = predicted instances with\n"
-    "no ground-truth match, FN = ground-truth instances with no predicted match.\n\n"
-    f"A PQ >= {ACCEPT_PQ_THRESHOLD} accepts the result -- computed directly from the ground\n"
-    "truth, not judged by Claude. Below that, either Claude (--claude-feedback) or a free,\n"
-    "deterministic rule (the default -- see propose_thresholds) looks at the TP/FP/FN/mean-IoU\n"
-    "breakdown and proposes a revised prob_thresh and/or nms_thresh to retry with.\n\n"
-    "Loops to good result: the number of iterations run before PQ first reached the accept\n"
-    "threshold (or the total number run, if none did) -- a measure of how many retries the\n"
-    "agentic loop needed, separate from the accuracy of the final result itself."
+    "Each iteration is scored 0-10 by evaluating the outlined image against three criteria:\n"
+    "  1. Do the outlines look visually accurate (no obvious missed nuclei, false positives,\n"
+    "     or merged/split instances)?\n"
+    "  2. Is the nucleus count plausible for what's shown?\n"
+    "  3. Does the result satisfy the user's original request?\n\n"
+    f"A score >= {ACCEPT_SCORE_THRESHOLD} accepts the result. A score below that triggers a\n"
+    "retry with revised prob_thresh/nms_thresh, if a threshold change would plausibly fix the\n"
+    "issue. When a PanNuke ground-truth mask is available, Panoptic Quality (PQ) against it\n"
+    f"decides accept/reject instead (bar: {ACCEPT_PQ_THRESHOLD})."
 )
 
 
-def loops_to_acceptance(history: list) -> tuple:
-    """Return (iteration_count, reached) where iteration_count is the 1-indexed
-    iteration that first met ACCEPT_PQ_THRESHOLD, or len(history) if none did."""
-    for entry in history:
-        if entry["pq"] >= ACCEPT_PQ_THRESHOLD:
-            return entry["iteration"], True
-    return len(history), False
-
-
-def best_entry(history: list) -> dict:
-    """The highest-PQ iteration seen (ties go to the earliest). The loop keeps exploring
-    after a non-accepting iteration, which can regress -- e.g. iteration 3 hits PQ=0.40,
-    iteration 5 lands at PQ=0.33 and would otherwise be reported as 'final'. Everything
-    that reports a final result uses this instead of history[-1]."""
-    return max(history, key=lambda e: e["pq"])
-
-
-PROB_STEP = 0.05
-NMS_STEP = 0.05
-
-
-def _already_tried(value: float, tried: list, tol: float = 0.001) -> bool:
-    """Float-tolerant membership check -- exact equality misses e.g. the model's
-    unrounded default (0.6924782541382084) matching a rounded proposal (0.692)."""
-    return any(abs(value - t) < tol for t in tried)
-
-
-def propose_thresholds(prob_thresh: float, nms_thresh: float, pq_result: dict, history: list | None = None) -> tuple:
-    """Free, deterministic alternative to evaluate_result -- no API call, no cost. Reasons
-    from the same TP/FP/FN/mean-IoU breakdown Claude would have been shown:
-      - FP > FN (more spurious detections than misses): raise prob_thresh.
-      - FN > FP (more misses than spurious detections): lower prob_thresh.
-      - FP == FN but mean IoU is still low (counts line up, boundaries don't): lower
-        nms_thresh -- duplicate/split outlines around one nucleus are the more common
-        StarDist failure mode once counts already match.
-    Two corrections on top of that base rule, both learned from watching it run:
-      - Oscillation: a fixed step can bounce forever between two thresholds that each
-        flip which error dominates, so the step is halved whenever the plain step would
-        revisit an already-tried value (tolerance-based -- see _already_tried).
-      - Dead lever: if the previous iteration's threshold change didn't move TP/FP/FN/
-        mean-IoU at all (e.g. nms_thresh had no effect because there were no overlapping
-        candidate detections to suppress), switch to the other knob instead of repeating
-        a change that provably does nothing on this image.
-    Returns (revised_prob_thresh, revised_nms_thresh, feedback) with exactly one of the
-    two revised values set (the other None)."""
-    history = history or []
-    fp, fn, mean_iou = pq_result["fp"], pq_result["fn"], pq_result["mean_iou"]
-    tried_prob = [e["prob_thresh"] for e in history]
-    tried_nms = [e["nms_thresh"] for e in history]
-
-    use_nms = fp == fn
-    dead_lever_note = ""
-    if history:
-        last = history[-1]
-        last_had_no_effect = (
-            last["tp"] == pq_result["tp"] and last["fp"] == fp and last["fn"] == fn
-            and abs(last["mean_iou"] - mean_iou) < 1e-9
-        )
-        if last_had_no_effect:
-            last_changed_nms = abs(last["nms_thresh"] - nms_thresh) > 1e-9
-            if last_changed_nms == use_nms:
-                use_nms = not use_nms
-                dead_lever_note = " Last change had no effect on the prediction -- switching knobs."
-
-    if not use_nms:
-        step = PROB_STEP
-        sign = 1 if fp >= fn else -1
-        revised_prob = round(min(max(prob_thresh + sign * step, 0.05), 0.95), 3)
-        while _already_tried(revised_prob, tried_prob) and step > 0.005:
-            step /= 2
-            revised_prob = round(min(max(prob_thresh + sign * step, 0.05), 0.95), 3)
-        comparison = f"FP={fp} > FN={fn}" if fp > fn else f"FN={fn} > FP={fp}" if fn > fp else f"FP == FN == {fp}"
-        direction = "raising" if sign > 0 else "lowering"
-        feedback = f"{comparison}: {direction} prob_thresh to {revised_prob}.{dead_lever_note}"
-        return revised_prob, None, feedback
-
-    step = NMS_STEP
-    revised_nms = round(max(nms_thresh - step, 0.01), 3)
-    while _already_tried(revised_nms, tried_nms) and step > 0.005:
-        step /= 2
-        revised_nms = round(max(nms_thresh - step, 0.01), 3)
-    feedback = (
-        f"FP == FN == {fp} but mean IoU={mean_iou:.3f}: lowering nms_thresh to "
-        f"{revised_nms} to reduce duplicate/split detections.{dead_lever_note}"
-    )
-    return None, revised_nms, feedback
-
-
-def run_pq_loop(
-    claude,
-    model: StarDist2D,
-    image: np.ndarray,
-    gt_labels: np.ndarray,
-    prompt: str,
-    max_iterations: int,
-    output_dir: Path,
-    stem: str,
-) -> tuple:
-    """Run the prob_thresh/nms_thresh retry loop for one image against its ground truth.
-    `claude` is an anthropic.Anthropic instance to use Claude for revision suggestions
-    (costs a small amount per call), or None to use the free, deterministic
-    propose_thresholds instead (the default -- see main()'s --claude-feedback flag).
-    Saves one outlined-instances PNG per iteration under output_dir, named
-    f"{stem}_iteration_{{i}}.png". Returns (final_labels, history, saved_paths)."""
-    prob_thresh, nms_thresh = round(model.thresholds.prob, 3), round(model.thresholds.nms, 3)
-    history = []
-    saved_paths = []
-    labels = None
-    for i in range(1, max_iterations + 1):
-        print(f"  [{stem}] iteration {i}: prob_thresh={prob_thresh:.3f}, nms_thresh={nms_thresh:.3f}")
-        labels, _ = run_stardist(model, image, prob_thresh=prob_thresh, nms_thresh=nms_thresh)
-        predicted_count = int(labels.max())
-        pq_result = compute_panoptic_quality(labels, gt_labels)
-        accept = pq_result["pq"] >= ACCEPT_PQ_THRESHOLD
-        print(
-            f"    nuclei={predicted_count}  PQ={pq_result['pq']:.3f} "
-            f"(mean_iou={pq_result['mean_iou']:.3f}, TP={pq_result['tp']}, "
-            f"FP={pq_result['fp']}, FN={pq_result['fn']})"
-        )
-
-        saved_path = output_dir / f"{stem}_iteration_{i}.png"
-        save_instance_outlines(image, labels, saved_path)
-        saved_paths.append(saved_path)
-
-        revised_prob = revised_nms = None
-        if accept:
-            feedback = "PQ met the acceptance threshold."
-        elif i == max_iterations:
-            # No budget left to act on a suggestion -- don't compute (or report) one.
-            # With max_iterations=1 this makes the loop a true single pass: no feedback
-            # mechanism runs at all, matching CountGD/CellViT's plain forward-pass mode.
-            feedback = "Reached max iterations without meeting the acceptance threshold."
-        elif claude is not None:
-            eval_result = evaluate_result(
-                claude, prompt, prob_thresh, nms_thresh, pq_result, str(saved_path), history
-            )
-            feedback = eval_result["feedback"]
-            revised_prob = eval_result.get("revised_prob_thresh")
-            revised_nms = eval_result.get("revised_nms_thresh")
-            print(f"    [Claude eval] feedback: {feedback}")
-        else:
-            revised_prob, revised_nms, feedback = propose_thresholds(prob_thresh, nms_thresh, pq_result, history)
-            print(f"    [rule-based] {feedback}")
-
-        history.append({
-            "iteration": i,
-            "prob_thresh": prob_thresh,
-            "nms_thresh": nms_thresh,
-            "predicted_count": predicted_count,
-            "pq": pq_result["pq"],
-            "mean_iou": pq_result["mean_iou"],
-            "tp": pq_result["tp"],
-            "fp": pq_result["fp"],
-            "fn": pq_result["fn"],
-            "feedback": feedback,
-        })
-
-        if accept or (revised_prob is None and revised_nms is None):
-            break
-        prob_thresh = revised_prob if revised_prob is not None else prob_thresh
-        nms_thresh = revised_nms if revised_nms is not None else nms_thresh
-
-    best = best_entry(history)
-    if best["iteration"] != history[-1]["iteration"]:
-        print(
-            f"  [{stem}] search continued past its best result -- reverting to iteration "
-            f"{best['iteration']} (PQ={best['pq']:.3f}) instead of the last one tried "
-            f"(PQ={history[-1]['pq']:.3f})"
-        )
-        labels, _ = run_stardist(model, image, prob_thresh=best["prob_thresh"], nms_thresh=best["nms_thresh"])
-
-    return labels, history, saved_paths
-
-
-def save_pdf_report(
-    pdf_path: Path,
-    image_path: str,
-    outlines_path: Path,
-    mask_shape: tuple,
-    num_nuclei: int,
-) -> None:
-    """Render a single page with the original image next to the outlined instance segmentation."""
-    with PdfPages(pdf_path) as pdf:
-        fig, (ax_orig, ax_out) = plt.subplots(1, 2, figsize=(11, 6))
-
-        ax_orig.imshow(Image.open(image_path).convert("RGB"))
-        ax_orig.axis("off")
-        ax_orig.set_title("Original image")
-
-        ax_out.imshow(Image.open(outlines_path))
-        ax_out.axis("off")
-        ax_out.set_title(f"StarDist instances ({num_nuclei} nuclei)")
-
-        fig.suptitle(
-            f"StarDist 2D_versatile_he -- {Path(image_path).name}\nMask shape: {mask_shape}",
-            fontsize=13,
-            fontweight="bold",
-        )
-        pdf.savefig(fig)
-        plt.close(fig)
-
-
-def save_loop_pdf_report(
-    pdf_path: Path,
-    user_prompt: str,
-    image_paths: list,
-    history: list,
-) -> None:
-    """Render a methodology page, then one page per iteration (outlined image + PQ breakdown), into a single PDF."""
+def save_pdf_report(pdf_path: Path, task_description: str, image_paths: list, history: list) -> None:
+    """Render a methodology page, then one page per iteration (outlined image + feedback), into a single PDF."""
     with PdfPages(pdf_path) as pdf:
         fig, ax = plt.subplots(figsize=(8.5, 11))
         ax.axis("off")
@@ -761,9 +449,7 @@ def save_loop_pdf_report(
         plt.close(fig)
 
         for entry, image_path in zip(history, image_paths):
-            fig, (ax_img, ax_text) = plt.subplots(
-                2, 1, figsize=(8.5, 11), gridspec_kw={"height_ratios": [4, 1]}
-            )
+            fig, (ax_img, ax_text) = plt.subplots(2, 1, figsize=(8.5, 11), gridspec_kw={"height_ratios": [4, 1]})
             ax_img.imshow(Image.open(image_path))
             ax_img.axis("off")
             ax_img.set_title(
@@ -772,331 +458,119 @@ def save_loop_pdf_report(
             )
 
             ax_text.axis("off")
+            score_line = f"PQ: {entry['pq']:.3f}" if "pq" in entry else f"Score: {entry['score']}/10"
             caption = (
-                f"Request: {user_prompt}\n"
+                f"Request: {task_description}\n"
                 f"Detected nuclei: {entry['predicted_count']}\n"
-                f"PQ: {entry['pq']:.3f}  (mean IoU: {entry['mean_iou']:.3f}, "
-                f"TP={entry['tp']}, FP={entry['fp']}, FN={entry['fn']})\n"
+                f"{score_line}\n"
                 f"Feedback: {textwrap.fill(entry['feedback'], 100)}"
             )
             ax_text.text(0, 1, caption, va="top", ha="left", fontsize=10, wrap=True)
-
             pdf.savefig(fig)
             plt.close(fig)
 
-        loops, reached = loops_to_acceptance(history)
-        final = best_entry(history)
+        final = history[-1]
         fig, ax = plt.subplots(figsize=(8.5, 11))
         ax.axis("off")
         ax.set_title("Summary", fontsize=15, fontweight="bold", loc="left")
-        loops_line = (
-            f"Loops to good result: {loops} of {len(history)} iterations run"
-            if reached
-            else f"Loops to good result: not reached (all {len(history)} iterations scored "
-                 f"below PQ {ACCEPT_PQ_THRESHOLD})"
-        )
+        score_line = f"Final PQ: {final['pq']:.3f}" if "pq" in final else f"Final score: {final['score']}/10"
         summary = (
-            f"Request: {user_prompt}\n\n"
-            f"{loops_line}\n"
-            f"Final prob_thresh: {final['prob_thresh']:.3f}\n"
-            f"Final nms_thresh: {final['nms_thresh']:.3f}\n"
+            f"Request: {task_description}\n\n"
+            f"Iterations run: {len(history)}\n"
+            f"Final thresholds: prob_thresh={final['prob_thresh']:.3f}, nms_thresh={final['nms_thresh']:.3f}\n"
             f"Final detected nuclei: {final['predicted_count']}\n"
-            f"Final PQ: {final['pq']:.3f} (mean IoU: {final['mean_iou']:.3f}, "
-            f"TP={final['tp']}, FP={final['fp']}, FN={final['fn']})"
+            f"{score_line}"
         )
-        ax.text(0, 0.95, summary, va="top", ha="left", fontsize=11, wrap=True)
-        pdf.savefig(fig)
-        plt.close(fig)
-
-
-def save_multi_loop_pdf_report(pdf_path: Path, user_prompt: str, results: list) -> None:
-    """Methodology page, then one page per image (its final outlined result + per-iteration
-    PQ trace), then an aggregate summary page across all images. `results` entries need
-    index/tissue/history/image_paths/loops/reached (see run_pq_loop + loops_to_acceptance)."""
-    with PdfPages(pdf_path) as pdf:
-        fig, ax = plt.subplots(figsize=(8.5, 11))
-        ax.axis("off")
-        ax.set_title("Scoring methodology", fontsize=15, fontweight="bold", loc="left")
-        ax.text(0, 0.95, SCORING_RUBRIC, va="top", ha="left", fontsize=11, wrap=True)
-        pdf.savefig(fig)
-        plt.close(fig)
-
-        for r in results:
-            history = r["history"]
-            final = best_entry(history)
-            fig, (ax_img, ax_text) = plt.subplots(
-                2, 1, figsize=(8.5, 11), gridspec_kw={"height_ratios": [4, 1]}
-            )
-            ax_img.imshow(Image.open(r["image_paths"][final["iteration"] - 1]))
-            ax_img.axis("off")
-            ax_img.set_title(
-                f"Image {r['index']} ({r['tissue']}) -- best iteration {final['iteration']}: "
-                f"prob_thresh={final['prob_thresh']:.3f}, nms_thresh={final['nms_thresh']:.3f}"
-            )
-
-            ax_text.axis("off")
-            pq_trace = " -> ".join(f"{e['pq']:.3f}" for e in history)
-            caption = (
-                f"Request: {user_prompt}\n"
-                f"Detected nuclei: {final['predicted_count']}\n"
-                f"PQ per iteration: {pq_trace}\n"
-                f"Final PQ: {final['pq']:.3f}  (mean IoU: {final['mean_iou']:.3f}, "
-                f"TP={final['tp']}, FP={final['fp']}, FN={final['fn']})\n"
-                f"Feedback: {textwrap.fill(final['feedback'], 100)}"
-            )
-            ax_text.text(0, 1, caption, va="top", ha="left", fontsize=10, wrap=True)
-
-            pdf.savefig(fig)
-            plt.close(fig)
-
-        fig, ax = plt.subplots(figsize=(8.5, 11))
-        ax.axis("off")
-        ax.set_title("Summary", fontsize=15, fontweight="bold", loc="left")
-        lines = [
-            f"Image {r['index']} ({r['tissue']}): final PQ={best_entry(r['history'])['pq']:.3f}, "
-            + (f"loops to good result={r['loops']}" if r["reached"] else f"not reached ({r['loops']} iterations run)")
-            for r in results
-        ]
-        mean_pq = sum(best_entry(r["history"])["pq"] for r in results) / len(results)
-        reached_count = sum(1 for r in results if r["reached"])
-        summary = (
-            f"Request: {user_prompt}\n\n"
-            + "\n".join(lines)
-            + f"\n\nMean final PQ across {len(results)} images: {mean_pq:.3f}\n"
-            + f"Reached PQ >= {ACCEPT_PQ_THRESHOLD} acceptance: {reached_count}/{len(results)} images"
-        )
-        ax.text(0, 0.95, summary, va="top", ha="left", fontsize=10, wrap=True)
-        pdf.savefig(fig)
-        plt.close(fig)
-
-
-def save_batch_pdf_report(pdf_path: Path, results: list) -> None:
-    """One page per image (original next to outlined instances), plus a summary page."""
-    with PdfPages(pdf_path) as pdf:
-        for r in results:
-            fig, (ax_orig, ax_out) = plt.subplots(1, 2, figsize=(11, 6))
-
-            ax_orig.imshow(Image.open(r["image_path"]))
-            ax_orig.axis("off")
-            ax_orig.set_title(f"Original ({r['tissue']})")
-
-            ax_out.imshow(Image.open(r["outlines_path"]))
-            ax_out.axis("off")
-            ax_out.set_title(f"StarDist instances ({r['num_nuclei']} nuclei)")
-
-            fig.suptitle(
-                f"PanNuke image {r['index']} -- {Path(r['image_path']).name}\n"
-                f"Mask shape: {r['mask_shape']}",
-                fontsize=13,
-                fontweight="bold",
-            )
-            pdf.savefig(fig)
-            plt.close(fig)
-
-        fig, ax = plt.subplots(figsize=(8.5, 11))
-        ax.axis("off")
-        ax.set_title("Summary", fontsize=15, fontweight="bold", loc="left")
-        lines = [f"Image {r['index']} ({r['tissue']}): {r['num_nuclei']} nuclei" for r in results]
-        total = sum(r["num_nuclei"] for r in results)
-        summary = "\n".join(lines) + f"\n\nTotal nuclei detected across {len(results)} images: {total}"
         ax.text(0, 0.95, summary, va="top", ha="left", fontsize=11, wrap=True)
         pdf.savefig(fig)
         plt.close(fig)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run StarDist's 2D_versatile_he model on image(s)")
-    parser.add_argument("--image", default=None, help="Path to a single input image (single pass, no ground truth)")
-    parser.add_argument(
-        "--pannuke-n", type=int, default=None,
-        help="Pull this many images straight from an official PanNuke fold (single pass per image)",
-    )
-    parser.add_argument(
-        "--pannuke-index", type=int, default=None,
-        help="Run the Claude-guided PQ retry loop against one PanNuke image+ground truth at this index",
-    )
-    parser.add_argument(
-        "--pannuke-loop-n", type=int, default=None,
-        help="Run the Claude-guided PQ retry loop independently over the first n PanNuke images (indices 0..n-1)",
-    )
-    parser.add_argument("--pannuke-fold", type=int, default=1, choices=[1, 2, 3], help="PanNuke fold to pull from")
-    parser.add_argument(
-        "--prompt", default="segment the individual nuclei",
-        help="What the segmentation should satisfy (--pannuke-index/--pannuke-loop-n paths only)",
-    )
-    parser.add_argument("--max-iterations", type=int, default=5, help="--pannuke-index/--pannuke-loop-n paths only")
-    parser.add_argument(
-        "--claude-feedback", action="store_true",
-        help="Use the Claude API to propose revised thresholds (costs a small amount per call). "
-             "Default is the free, deterministic propose_thresholds heuristic -- no API key needed.",
-    )
-    parser.add_argument(
-        "--diverse-tissues", action="store_true",
-        help="--pannuke-loop-n only: spread the sample across different tissue types instead of "
-             "taking the first n images (PanNuke stores each fold as contiguous per-tissue blocks, "
-             "so the plain first-n sample is usually all one tissue). See select_diverse_indices.",
-    )
-    parser.add_argument("--seed", type=int, default=0, help="Shuffle seed for --diverse-tissues")
+    parser = argparse.ArgumentParser(description="Run StarDist with Claude as evaluator/tuner")
+    parser.add_argument("--image", default=None, help="Path to the input image (ignored if --pannuke-index is set)")
+    parser.add_argument("--prompt", required=True, help="What the user asked for, e.g. 'segment the individual nuclei'")
+    parser.add_argument("--pannuke-index", type=int, default=None, help="Pull this PanNuke sample instead of --image; scores against its real ground truth via PQ")
+    parser.add_argument("--pannuke-fold", type=int, default=1, choices=[1, 2, 3])
+    parser.add_argument("--max-iterations", type=int, default=3)
     parser.add_argument("--output-dir", default="./stardist_agent_output")
-    parser.add_argument("--pdf-name", default=PDF_NAME, help="Filename for the saved PDF report")
+    parser.add_argument("--pdf-name", default=PDF_NAME)
     args = parser.parse_args()
-    if args.max_iterations < 1:
-        parser.error("--max-iterations must be at least 1")
-    if not args.image and args.pannuke_n is None and args.pannuke_index is None and args.pannuke_loop_n is None:
-        parser.error("one of --image, --pannuke-n, --pannuke-index, or --pannuke-loop-n is required")
-    if args.pannuke_loop_n is not None and args.pannuke_loop_n < 1:
-        parser.error("--pannuke-loop-n must be at least 1")
+    if args.image is None and args.pannuke_index is None:
+        parser.error("one of --image or --pannuke-index is required")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    model = StarDist2D.from_pretrained(PRETRAINED_MODEL)
-    if model is None:
-        raise RuntimeError(f"Failed to load StarDist model '{PRETRAINED_MODEL}'")
-
+    ground_truth_labels = None
     if args.pannuke_index is not None:
-        claude = anthropic.Anthropic() if args.claude_feedback else None
         print(f"Fetching PanNuke fold {args.pannuke_fold} image {args.pannuke_index}...")
-        image, gt_labels, tissue = load_pannuke_sample(args.pannuke_fold, args.pannuke_index)
-        print(f"tissue={tissue}  ground-truth nuclei={int(gt_labels.max())}")
+        raw_image, ground_truth_labels, tissue = load_pannuke_sample(args.pannuke_fold, args.pannuke_index)
+        print(f"tissue={tissue}  ground-truth nuclei={int(ground_truth_labels.max())}")
+        image_path = output_dir / f"pannuke_fold{args.pannuke_fold}_{args.pannuke_index:02d}.png"
+        Image.fromarray(raw_image).save(image_path)
+        args.image = str(image_path)
 
-        stem = f"pannuke_fold{args.pannuke_fold}_{args.pannuke_index:02d}"
-        labels, history, saved_paths = run_pq_loop(
-            claude, model, image, gt_labels, args.prompt, args.max_iterations, output_dir, stem
-        )
-
-        mask_path = output_dir / MASK_NAME
-        np.save(mask_path, labels)
-
-        overlay_path = output_dir / OVERLAY_NAME
-        save_overlay(image, labels, overlay_path)
-
-        pdf_path = unique_path(output_dir / args.pdf_name)
-        save_loop_pdf_report(pdf_path, args.prompt, saved_paths, history)
-
-        final = best_entry(history)
-        print("\n=== Final result ===")
-        print(f"Mask shape: {labels.shape}")
-        print(f"Detected nuclei: {final['predicted_count']}")
-        print(f"Final PQ: {final['pq']:.3f}")
-        print(f"Mask saved: {mask_path}")
-        print(f"Overlay saved: {overlay_path}")
-        print(f"Outlined image: {saved_paths[final['iteration'] - 1]}")
-        print(f"PDF report saved: {pdf_path}")
-        print(f"History: {json.dumps(history, indent=2)}")
-        return
-
-    if args.pannuke_loop_n is not None:
-        claude = anthropic.Anthropic() if args.claude_feedback else None
-        if args.diverse_tissues:
-            print(f"Fetching tissue-type layout for PanNuke fold {args.pannuke_fold}...")
-            all_types = load_pannuke_types(args.pannuke_fold)
-            selected = select_diverse_indices(
-                all_types, args.pannuke_loop_n, max_index=TISSUE_DIVERSITY_MAX_INDEX, seed=args.seed
-            )
-            n_tissues = len(set(all_types[i] for i in selected))
-            print(
-                f"Selected {len(selected)} images spanning {n_tissues} tissue types "
-                f"(fold indices {selected[0]}-{selected[-1]}, {100 * (selected[-1] + 1) / len(all_types):.0f}% of the fold)"
-            )
-            images_prefix, gt_labels_prefix, tissue_prefix = load_pannuke_samples(
-                args.pannuke_fold, selected[-1] + 1
-            )
-            image_indices = selected
-            images = [images_prefix[i] for i in selected]
-            gt_labels_list = [gt_labels_prefix[i] for i in selected]
-            tissue_labels = [tissue_prefix[i] for i in selected]
-        else:
-            print(f"Fetching {args.pannuke_loop_n} images + ground truth from PanNuke fold {args.pannuke_fold}...")
-            images, gt_labels_list, tissue_labels = load_pannuke_samples(args.pannuke_fold, args.pannuke_loop_n)
-            image_indices = list(range(args.pannuke_loop_n))
-
-        results = []
-        for idx, image, gt_labels, tissue in zip(image_indices, images, gt_labels_list, tissue_labels):
-            stem = f"pannuke_fold{args.pannuke_fold}_{idx:04d}"
-            print(f"\n=== Image {idx} ({tissue}), ground-truth nuclei={int(gt_labels.max())} ===")
-            labels, history, saved_paths = run_pq_loop(
-                claude, model, image, gt_labels, args.prompt, args.max_iterations, output_dir, stem
-            )
-            np.save(output_dir / f"{stem}_mask.npy", labels)
-
-            loops, reached = loops_to_acceptance(history)
-            print(
-                f"[{idx}] tissue={tissue} final PQ={best_entry(history)['pq']:.3f} "
-                f"({'reached' if reached else 'did not reach'} PQ>={ACCEPT_PQ_THRESHOLD} "
-                f"after {loops} iterations)"
-            )
-            results.append({
-                "index": idx, "tissue": tissue, "history": history,
-                "image_paths": saved_paths, "loops": loops, "reached": reached,
-            })
-
-        pdf_path = unique_path(output_dir / args.pdf_name)
-        save_multi_loop_pdf_report(pdf_path, args.prompt, results)
-
-        mean_pq = sum(best_entry(r["history"])["pq"] for r in results) / len(results)
-        reached_count = sum(1 for r in results if r["reached"])
-        print("\n=== StarDist PQ-loop batch result ===")
-        print(f"Images processed: {len(results)}")
-        print(f"Mean final PQ: {mean_pq:.3f}")
-        print(f"Reached PQ >= {ACCEPT_PQ_THRESHOLD}: {reached_count}/{len(results)}")
-        print(f"PDF report saved: {pdf_path}")
-        return
-
-    if args.pannuke_n is not None:
-        print(f"Fetching {args.pannuke_n} images from PanNuke fold {args.pannuke_fold}...")
-        images, tissue_labels = load_pannuke_images(args.pannuke_fold, args.pannuke_n)
-        results = []
-        for idx, (image, tissue) in enumerate(zip(images, tissue_labels)):
-            stem = f"pannuke_fold{args.pannuke_fold}_{idx:02d}"
-            image_path = output_dir / f"{stem}.png"
-            Image.fromarray(image).save(image_path)
-
-            labels, details = run_stardist(model, image)
-            num_nuclei = int(labels.max())
-            np.save(output_dir / f"{stem}_mask.npy", labels)
-
-            outlines_path = output_dir / f"{stem}_outlines.png"
-            save_instance_outlines(image, labels, outlines_path)
-
-            print(f"[{idx}] tissue={tissue} nuclei={num_nuclei}")
-            results.append({
-                "index": idx, "tissue": tissue, "image_path": image_path,
-                "outlines_path": outlines_path, "mask_shape": labels.shape, "num_nuclei": num_nuclei,
-            })
-
-        pdf_path = unique_path(output_dir / args.pdf_name)
-        save_batch_pdf_report(pdf_path, results)
-
-        print("\n=== StarDist batch result ===")
-        print(f"Images processed: {len(results)}")
-        print(f"Total nuclei detected: {sum(r['num_nuclei'] for r in results)}")
-        print(f"PDF report saved: {pdf_path}")
-        return
-
+    claude = anthropic.Anthropic()
+    model = StarDist2D.from_pretrained(PRETRAINED_MODEL)
     image = load_image(args.image)
-    labels, details = run_stardist(model, image)
-    num_nuclei = int(labels.max())
+    prob_thresh, nms_thresh = round(model.thresholds.prob, 3), round(model.thresholds.nms, 3)
 
-    mask_path = output_dir / MASK_NAME
-    np.save(mask_path, labels)
+    history = []
+    saved_paths = []
+    saved_path = None
+    labels = None
+    for i in range(1, args.max_iterations + 1):
+        print(f"\n--- Iteration {i}: prob_thresh={prob_thresh:.3f}, nms_thresh={nms_thresh:.3f} ---")
+        labels, _ = run_stardist(model, image, prob_thresh=prob_thresh, nms_thresh=nms_thresh)
+        predicted_count = int(labels.max())
+        print(f"[StarDist] nuclei={predicted_count}")
 
-    overlay_path = output_dir / OVERLAY_NAME
-    save_overlay(image, labels, overlay_path)
+        saved_path = output_dir / f"iteration_{i}.png"
+        save_instance_outlines(image, labels, saved_path)
+        saved_paths.append(saved_path)
 
-    outlines_path = output_dir / OUTLINES_NAME
-    save_instance_outlines(image, labels, outlines_path)
+        if ground_truth_labels is not None:
+            pq_result = compute_panoptic_quality(labels, ground_truth_labels)
+            accept = pq_result["pq"] >= ACCEPT_PQ_THRESHOLD
+            if accept:
+                feedback, revised_prob, revised_nms = "PQ met the acceptance threshold.", None, None
+            else:
+                proposal = propose_threshold_revision(
+                    claude, args.prompt, prob_thresh, nms_thresh, pq_result, str(saved_path), history
+                )
+                feedback = proposal["feedback"]
+                revised_prob, revised_nms = proposal.get("revised_prob_thresh"), proposal.get("revised_nms_thresh")
+            print(f"[metric] PQ={pq_result['pq']:.3f} accept={accept}")
+            history.append({
+                "iteration": i, "prob_thresh": prob_thresh, "nms_thresh": nms_thresh,
+                "predicted_count": predicted_count, "pq": pq_result["pq"], "feedback": feedback,
+            })
+        else:
+            eval_result = evaluate_result(claude, args.prompt, prob_thresh, nms_thresh, predicted_count, str(saved_path), history)
+            accept = eval_result["accept"]
+            revised_prob, revised_nms = eval_result.get("revised_prob_thresh"), eval_result.get("revised_nms_thresh")
+            print(f"[Claude eval] score={eval_result['score']} accept={accept}")
+            history.append({
+                "iteration": i, "prob_thresh": prob_thresh, "nms_thresh": nms_thresh,
+                "predicted_count": predicted_count, "score": eval_result["score"], "feedback": eval_result["feedback"],
+            })
 
-    pdf_path = unique_path(output_dir / args.pdf_name)
-    save_pdf_report(pdf_path, args.image, outlines_path, labels.shape, num_nuclei)
+        if accept or (revised_prob is None and revised_nms is None):
+            break
+        if revised_prob is not None:
+            prob_thresh = revised_prob
+        if revised_nms is not None:
+            nms_thresh = revised_nms
 
-    print("=== StarDist result ===")
-    print(f"Mask shape: {labels.shape}")
-    print(f"Detected nuclei: {num_nuclei}")
-    print(f"Mask saved: {mask_path}")
-    print(f"Overlay saved: {overlay_path}")
-    print(f"Instance outlines saved: {outlines_path}")
-    print(f"PDF report saved: {pdf_path}")
+    pdf_path = output_dir / args.pdf_name
+    save_pdf_report(pdf_path, args.prompt, saved_paths, history)
+
+    print("\n=== Final result ===")
+    print(f"Detected nuclei: {int(labels.max())}")
+    print(f"Outlines image: {saved_path}")
+    print(f"PDF report: {pdf_path}")
+    print(f"History: {json.dumps(history, indent=2)}")
 
 
 if __name__ == "__main__":
