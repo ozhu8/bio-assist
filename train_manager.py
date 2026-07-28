@@ -22,10 +22,40 @@ Usage:
 """
 import argparse
 import json
+import time
+import urllib.request
+from collections import deque
 from itertools import zip_longest
 from pathlib import Path
 
 from PIL import Image # pyright: ignore[reportMissingImports]
+
+# Private, hard-to-guess ntfy.sh topic (free, no signup) -- lets progress/crash notifications
+# reach a phone without needing to SSH into the box or be on any particular network. Subscribe
+# in the ntfy app or at https://ntfy.sh/olivia-bioassist-ZdJppIMgevQR in a browser.
+NTFY_TOPIC = "olivia-bioassist-ZdJppIMgevQR"
+
+# Per-image retry/deferral policy for run_*_trial failures (2026-07-24: a CountGD CancelledError
+# and separately a CellViT CUDA-contention error both took down the entire run over one bad
+# image). Instead of stopping outright, a failing task is requeued at the *back* of the task
+# list -- naturally trying other queued images (often a different agent entirely) first, giving
+# a flaky hosted Space or a GPU held by another process time to recover -- and only permanently
+# given up on after MAX_TASK_RETRIES attempts, at which point that one image is logged and
+# skipped rather than stopping the whole run.
+MAX_TASK_RETRIES = 3
+DEFER_WAIT_SECONDS = 60  # only slept when literally nothing else is left in the queue to try first
+
+
+def notify(message: str) -> None:
+    """Best-effort push notification via ntfy.sh -- network hiccups here should never crash the
+    actual training run, so failures just print locally instead of raising."""
+    try:
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{NTFY_TOPIC}", data=message.encode("utf-8"), method="POST"
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as exc:
+        print(f"  [notify] failed to send push notification: {exc}")
 
 from bbbc005 import load_bbbc005_samples
 from manager_agent import (
@@ -341,11 +371,13 @@ def interleave_tasks(*task_lists: list) -> list:
 
 def save_checkpoint(
     path: Path, notes: list, running_prompt: str, expert_notes: str, escalation_qa_log: list, total_tasks: int,
+    permanently_failed: list | None = None,
 ) -> None:
     completed_ids = [n["image_id"] for n in notes]
     path.write_text(json.dumps({
         "completed_ids": completed_ids, "running_prompt": running_prompt, "expert_notes": expert_notes,
         "escalation_qa_log": escalation_qa_log, "notes": notes,
+        "permanently_failed": permanently_failed or [],
     }, indent=2, default=str))
     print(f"[checkpoint] {path} ({len(completed_ids)}/{total_tasks} images)")
 
@@ -413,15 +445,20 @@ def main():
     running_prompt = ""
     expert_notes = ""
     escalation_qa_log = []
+    permanently_failed = []
     if args.resume_from:
         checkpoint = json.loads(Path(args.resume_from).read_text())
         notes = checkpoint["notes"]
         running_prompt = checkpoint["running_prompt"]
         expert_notes = checkpoint.get("expert_notes", "")  # absent in checkpoints written before this existed
         escalation_qa_log = checkpoint.get("escalation_qa_log", [])  # ditto
+        permanently_failed = checkpoint.get("permanently_failed", [])  # ditto -- gets another
+        # MAX_TASK_RETRIES attempts this run rather than being excluded outright, since whatever
+        # made it fail before (a flaky Space, GPU contention) may no longer apply now.
         print(f"Resumed from {args.resume_from}: {len(notes)} images already done, "
               f"running prompt is {len(running_prompt)} chars, expert notes are {len(expert_notes)} chars, "
-              f"escalation Q&A log has {len(escalation_qa_log)} resolved case(s).")
+              f"escalation Q&A log has {len(escalation_qa_log)} resolved case(s), "
+              f"{len(permanently_failed)} previously-gave-up-on image(s) will be retried.")
 
     # expert_notes is an LLM-generated paraphrase that gets rewritten from scratch on every new
     # escalation (merge_expert_notes), which can drop/reword older specifics as it generalizes;
@@ -436,42 +473,102 @@ def main():
     if len(remaining_tasks) < len(tasks):
         print(f"Skipping {len(tasks) - len(remaining_tasks)} already-completed images from the resumed checkpoint.")
 
+    notify(f"train_manager.py starting: {len(remaining_tasks)} image(s) queued, output_dir={output_dir}")
+
     batch_start = 0
     new_notes = []
-    for i, task in enumerate(remaining_tasks, 1):
-        print(f"=== [{i}/{len(remaining_tasks)}] {task['image_id']} ({task['agent']}) ===")
-        if task["agent"] == "countgd":
-            note = run_countgd_trial(
-                manager, task["image_path"], task["image_id"], task["ground_truth_count"],
-                args.max_iterations, output_dir, expert_notes=expert_context,
+    task_queue = deque(remaining_tasks)
+    retry_counts = {}  # image_id -> attempts so far, across deferrals
+    total = len(remaining_tasks)
+    attempt_num = 0
+    last_notify_count = 0
+    while task_queue:
+        task = task_queue.popleft()
+        attempt_num += 1
+        print(f"=== [{len(new_notes) + 1}/{total}] {task['image_id']} ({task['agent']}) "
+              f"(attempt {attempt_num}) ===")
+        try:
+            if task["agent"] == "countgd":
+                note = run_countgd_trial(
+                    manager, task["image_path"], task["image_id"], task["ground_truth_count"],
+                    args.max_iterations, output_dir, expert_notes=expert_context,
+                )
+            elif task["agent"] == "cellvit":
+                note = run_cellvit_trial(
+                    manager, task["image_path"], task["image_id"], task["ground_truth_counts_by_type"],
+                    task["ground_truth_class_labels"], args.max_iterations, output_dir,
+                    tissue=task["tissue"], expert_notes=expert_context,
+                )
+            else:
+                note = run_stardist_trial(
+                    manager, task["image_path"], task["image_id"], task["ground_truth_labels"],
+                    args.max_iterations, output_dir, tissue=task["tissue"], expert_notes=expert_context,
+                )
+        except Exception as exc:
+            # A long unattended run (e.g. overnight/multi-day in tmux) shouldn't stop entirely
+            # over one bad image -- a flaky hosted Space (CountGD) or a GPU another process is
+            # currently holding (CellViT) are both often fine again a bit later. Defer this task
+            # to the back of the queue so other images (often a different agent, which sidesteps
+            # whatever's currently struggling) get tried first, and only give up on this specific
+            # image after MAX_TASK_RETRIES attempts -- ClaudeVLM._create_with_retry/
+            # CellvitClient._construct_with_retry already retry the shorter, lower-level blips on
+            # their own; reaching here means either those were exhausted or exceeded their own
+            # budget, not that this is necessarily a permanent, non-transient failure.
+            attempts = retry_counts.get(task["image_id"], 0) + 1
+            retry_counts[task["image_id"]] = attempts
+            print(f"\n!!! {task['image_id']} ({task['agent']}) failed (attempt {attempts}/"
+                  f"{MAX_TASK_RETRIES}): {exc.__class__.__name__}: {exc}")
+            if attempts < MAX_TASK_RETRIES:
+                if not task_queue:
+                    print(f"!!! Nothing else left in the queue to try first -- waiting "
+                          f"{DEFER_WAIT_SECONDS}s before retrying.")
+                    time.sleep(DEFER_WAIT_SECONDS)
+                else:
+                    print("!!! Deferring -- will retry after the other queued images.")
+                task_queue.append(task)
+                continue
+            print(f"!!! Giving up on {task['image_id']} after {MAX_TASK_RETRIES} attempts -- "
+                  f"logging it and continuing with the rest of the queue.")
+            permanently_failed.append({
+                "image_id": task["image_id"], "agent": task["agent"],
+                "error": f"{exc.__class__.__name__}: {exc}",
+            })
+            notify(f"!!! Gave up on {task['image_id']} ({task['agent']}) after {MAX_TASK_RETRIES} "
+                   f"attempts: {exc.__class__.__name__}: {exc}")
+            save_checkpoint(
+                checkpoint_path, notes, running_prompt, expert_notes, escalation_qa_log, len(tasks),
+                permanently_failed=permanently_failed,
             )
-        elif task["agent"] == "cellvit":
-            note = run_cellvit_trial(
-                manager, task["image_path"], task["image_id"], task["ground_truth_counts_by_type"],
-                task["ground_truth_class_labels"], args.max_iterations, output_dir,
-                tissue=task["tissue"], expert_notes=expert_context,
-            )
-        else:
-            note = run_stardist_trial(
-                manager, task["image_path"], task["image_id"], task["ground_truth_labels"],
-                args.max_iterations, output_dir, tissue=task["tissue"], expert_notes=expert_context,
-            )
+            continue
         notes.append(note)
         new_notes.append(note)
         print(f"  initial={note['initial_score']}  final={note['final_score']}  accepted={note['accepted']}")
 
-        if i % args.batch_size == 0 or i == len(remaining_tasks):
-            batch = new_notes[batch_start:i]
-            batch_start = i
+        if len(new_notes) - last_notify_count >= 20 or not task_queue:
+            notify(f"Progress: {len(new_notes)}/{total} images done, "
+                   f"{len(permanently_failed)} gave up, {len(task_queue)} still queued/deferred.")
+            last_notify_count = len(new_notes)
+
+        if len(new_notes) % args.batch_size == 0 or not task_queue:
+            batch = new_notes[batch_start:len(new_notes)]
+            batch_start = len(new_notes)
             stats = compute_batch_stats(batch)
             print(f"--- batch stats ---\n{json.dumps(stats, indent=2)}")
             running_prompt = summarize_and_merge(manager.qwen, running_prompt, batch, stats)
             print(f"--- updated training prompt ---\n{running_prompt}\n")
-            save_checkpoint(checkpoint_path, notes, running_prompt, expert_notes, escalation_qa_log, len(tasks))
+            save_checkpoint(
+                checkpoint_path, notes, running_prompt, expert_notes, escalation_qa_log, len(tasks),
+                permanently_failed=permanently_failed,
+            )
 
     out_path = output_dir / "training_result.json"
-    out_path.write_text(json.dumps({"final_prompt": running_prompt, "notes": notes}, indent=2, default=str))
+    out_path.write_text(json.dumps(
+        {"final_prompt": running_prompt, "notes": notes, "permanently_failed": permanently_failed},
+        indent=2, default=str,
+    ))
     print(f"\nFinal training prompt written to {out_path}")
+    notify(f"train_manager.py finished: {len(notes)} images completed, "
+           f"{len(permanently_failed)} gave up. {out_path}")
 
     if manager._stardist_worker is not None:
         manager._stardist_worker.shutdown()

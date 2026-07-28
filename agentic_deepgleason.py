@@ -27,7 +27,6 @@ Usage:
 """
 import argparse
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -72,30 +71,7 @@ def run_deepgleason(slide_path: str, output_dir: Path, generate_overlay: bool = 
     generate_overlay=True -- DeepGleason only writes the classification
     BigTIFF overlay when --generate_overlay is passed; the path is
     predictable from its own naming convention (slide stem + "_gleason.tiff"
-    in output_dir, confirmed against code/main.py).
-
-    Checks DEEPGLEASON_PYTHON/DEEPGLEASON_REPO/DEEPGLEASON_MODEL actually exist before shelling
-    out -- without this, an unconfigured machine (e.g. DeepGleason's own conda env/repo/weights
-    never set up, per this file's module docstring) only found out via a bare
-    FileNotFoundError/CalledProcessError from subprocess.run, with no indication of which of the
-    three was missing or how to fix it."""
-    missing = []
-    if not (Path(DEEPGLEASON_PYTHON).exists() or shutil.which(DEEPGLEASON_PYTHON)):
-        missing.append(f"Python interpreter not found: {DEEPGLEASON_PYTHON} (DEEPGLEASON_PYTHON)")
-    main_py = DEEPGLEASON_REPO / "code" / "main.py"
-    if not main_py.exists():
-        missing.append(
-            f"Repo entrypoint not found: {main_py} (DEEPGLEASON_REPO={DEEPGLEASON_REPO}) -- "
-            "git clone https://github.com/frankkramer-lab/DeepGleason.git and run `git lfs pull` in it"
-        )
-    if not DEEPGLEASON_MODEL.exists():
-        missing.append(f"Model checkpoint not found: {DEEPGLEASON_MODEL} (DEEPGLEASON_MODEL)")
-    if missing:
-        raise RuntimeError(
-            "DeepGleason isn't set up on this machine yet:\n  " + "\n  ".join(missing) +
-            "\nSee this file's module docstring for full setup instructions."
-        )
-
+    in output_dir, confirmed against code/main.py)."""
     predictions_path = output_dir / "predictions.csv"
     cmd = [
         DEEPGLEASON_PYTHON, str(DEEPGLEASON_REPO / "code" / "main.py"),
@@ -161,10 +137,8 @@ def render_overlay_preview(overlay_tiff_path: Path, preview_path: Path, max_dim:
     decoding the full pyramid level, which plain PIL.Image.open on a tiled BigTIFF does not
     reliably support across libtiff builds."""
     import pyvips  # pyright: ignore[reportMissingImports]
-    # pyvips generates methods dynamically via __getattr__ (no stubs), so Pylance can't infer
-    # thumbnail()'s return type and treats it as None -- it's a real vips Image at runtime.
-    image = pyvips.Image.thumbnail(str(overlay_tiff_path), max_dim)  # type: ignore[attr-defined]
-    image.write_to_file(str(preview_path) + "[compression=png]")  # type: ignore[attr-defined]
+    image = pyvips.Image.thumbnail(str(overlay_tiff_path), max_dim)
+    image.write_to_file(str(preview_path))
 
 
 def run_tumor_detection(slide_path: str, output_dir, confidence_threshold: float = 0.0) -> dict:
