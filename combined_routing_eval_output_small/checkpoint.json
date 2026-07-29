@@ -52,6 +52,21 @@
         "fp": 1,
         "fn": 7
       }
+    },
+    {
+      "image_id": "bbbc005_001_C27",
+      "dataset": "bbbc005",
+      "task_description": "count the individual cells",
+      "known_agent": "countgd",
+      "routed_agent": "countgd",
+      "routing_correct": true,
+      "blind_result": {
+        "count_target": "cell",
+        "predicted_count": 0,
+        "ground_truth_count": 27,
+        "mae": 27,
+        "within_tolerance": false
+      }
     }
   ]
 }
