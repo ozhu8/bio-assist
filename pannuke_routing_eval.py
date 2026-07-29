@@ -39,10 +39,25 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--model-id", default=MODEL_ID)
     parser.add_argument("--output-dir", default="./pannuke_routing_eval_output")
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume from <output-dir>/checkpoint.json if it exists -- skips images already "
+             "recorded there (matched by image_id) instead of redoing them. The checkpoint is "
+             "rewritten to disk after every single image (not just every batch), so a run that "
+             "gets interrupted mid-way -- killed, disconnected, machine put to sleep -- loses at "
+             "most the one image that was in flight when it stopped.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / "checkpoint.json"
+
+    results = []
+    if args.resume and checkpoint_path.exists():
+        results = json.loads(checkpoint_path.read_text())["results"]
+        print(f"Resumed from {checkpoint_path}: {len(results)} image(s) already done.")
+    completed_ids = {r["image_id"] for r in results}
 
     print(f"Loading {args.n} diverse PanNuke fold {args.fold} image(s) (split={args.split})...")
     stardist_worker = StardistWorker()
@@ -53,9 +68,11 @@ def main():
     print(f"Loading Qwen ({args.model_id})...")
     qwen = QwenVLM(args.model_id)
 
-    results = []
     for idx, image, gt_labels, tissue in zip(indices, images, gt_labels_list, tissues):
         image_id = f"pannuke_f{args.fold}_{idx:04d}_{tissue}"
+        if image_id in completed_ids:
+            print(f"[{image_id}] already in checkpoint, skipping")
+            continue
         image_path = str(output_dir / f"{image_id}.png")
         Image.fromarray(image).save(image_path)
 
@@ -93,6 +110,10 @@ def main():
                 "fn": pq_result["fn"],
             },
         })
+        # Written after every image (not batched) -- each Qwen call can take minutes on this
+        # machine (see CLAUDE.md / no GPU here), so batching the checkpoint would still lose a
+        # lot of wall-clock progress to a mid-run interruption.
+        checkpoint_path.write_text(json.dumps({"results": results}, indent=2))
 
     stardist_worker.shutdown()
 
