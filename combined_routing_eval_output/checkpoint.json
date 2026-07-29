@@ -1,0 +1,23 @@
+{
+  "results": [
+    {
+      "image_id": "pannuke_f1_0000_Breast",
+      "dataset": "pannuke",
+      "task_description": "segment the individual nuclei",
+      "known_agent": "stardist",
+      "routed_agent": "stardist",
+      "routing_correct": true,
+      "blind_result": {
+        "prob_thresh": 0.5,
+        "nms_thresh": 0.3,
+        "predicted_nuclei": 11,
+        "ground_truth_nuclei": 8,
+        "pq": 0.5851098387970958,
+        "mean_iou": 0.7940776383674872,
+        "tp": 7,
+        "fp": 4,
+        "fn": 1
+      }
+    }
+  ]
+}
