@@ -18,6 +18,21 @@
         "fp": 6,
         "fn": 8
       }
+    },
+    {
+      "image_id": "bbbc005_000_C1",
+      "dataset": "bbbc005",
+      "task_description": "count the individual cells",
+      "known_agent": "countgd",
+      "routed_agent": "countgd",
+      "routing_correct": true,
+      "blind_result": {
+        "count_target": "moon",
+        "predicted_count": 1,
+        "ground_truth_count": 1,
+        "mae": 0,
+        "within_tolerance": true
+      }
     }
   ]
 }
