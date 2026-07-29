@@ -1,0 +1,23 @@
+{
+  "results": [
+    {
+      "image_id": "pannuke_f1_0867_Lung",
+      "dataset": "pannuke",
+      "task_description": "segment the individual nuclei",
+      "known_agent": "stardist",
+      "routed_agent": "stardist",
+      "routing_correct": true,
+      "blind_result": {
+        "prob_thresh": 0.5,
+        "nms_thresh": 0.3,
+        "predicted_nuclei": 32,
+        "ground_truth_nuclei": 34,
+        "pq": 0.6045313558685036,
+        "mean_iou": 0.7672897978331008,
+        "tp": 26,
+        "fp": 6,
+        "fn": 8
+      }
+    }
+  ]
+}
