@@ -33,6 +33,25 @@
         "mae": 0,
         "within_tolerance": true
       }
+    },
+    {
+      "image_id": "pannuke_f1_0912_Kidney",
+      "dataset": "pannuke",
+      "task_description": "segment the individual nuclei",
+      "known_agent": "stardist",
+      "routed_agent": "stardist",
+      "routing_correct": true,
+      "blind_result": {
+        "prob_thresh": 0.5,
+        "nms_thresh": 0.3,
+        "predicted_nuclei": 17,
+        "ground_truth_nuclei": 23,
+        "pq": 0.614565916097416,
+        "mean_iou": 0.7682073951217699,
+        "tp": 16,
+        "fp": 1,
+        "fn": 7
+      }
     }
   ]
 }
