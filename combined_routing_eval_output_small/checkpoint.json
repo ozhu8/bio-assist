@@ -120,6 +120,40 @@
         "fp": 6,
         "fn": 11
       }
+    },
+    {
+      "image_id": "bbbc005_003_C74",
+      "dataset": "bbbc005",
+      "task_description": "count the individual cells",
+      "known_agent": "countgd",
+      "routed_agent": "countgd",
+      "routing_correct": true,
+      "blind_result": {
+        "count_target": "cell",
+        "predicted_count": 0,
+        "ground_truth_count": 74,
+        "mae": 74,
+        "within_tolerance": false
+      }
+    },
+    {
+      "image_id": "pannuke_f1_1411_Testis",
+      "dataset": "pannuke",
+      "task_description": "segment the individual nuclei",
+      "known_agent": "stardist",
+      "routed_agent": "stardist",
+      "routing_correct": true,
+      "blind_result": {
+        "prob_thresh": 0.5,
+        "nms_thresh": 0.3,
+        "predicted_nuclei": 22,
+        "ground_truth_nuclei": 23,
+        "pq": 0.6891463411284998,
+        "mean_iou": 0.8160943513363813,
+        "tp": 19,
+        "fp": 3,
+        "fn": 4
+      }
     }
   ]
 }
