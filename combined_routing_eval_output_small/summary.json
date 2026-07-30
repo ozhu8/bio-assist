@@ -1,4 +1,25 @@
 {
+  "n": 10,
+  "bbbc005_fetch_failed": false,
+  "routing_accuracy": 1.0,
+  "routed_agent_counts": {
+    "countgd": 5,
+    "stardist": 5
+  },
+  "by_dataset": {
+    "bbbc005": {
+      "n": 5,
+      "routing_accuracy": 1.0,
+      "blind_countgd_mean_mae": 50.8,
+      "blind_countgd_within_tolerance_rate": 0.2
+    },
+    "pannuke": {
+      "n": 5,
+      "routing_accuracy": 1.0,
+      "blind_stardist_mean_pq": 0.5537918596511744,
+      "blind_stardist_mean_iou": 0.7736656083736313
+    }
+  },
   "results": [
     {
       "image_id": "pannuke_f1_0867_Lung",
