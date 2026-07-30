@@ -67,6 +67,59 @@
         "mae": 27,
         "within_tolerance": false
       }
+    },
+    {
+      "image_id": "pannuke_f1_1061_Uterus",
+      "dataset": "pannuke",
+      "task_description": "segment the individual nuclei",
+      "known_agent": "stardist",
+      "routed_agent": "stardist",
+      "routing_correct": true,
+      "blind_result": {
+        "prob_thresh": 0.5,
+        "nms_thresh": 0.3,
+        "predicted_nuclei": 58,
+        "ground_truth_nuclei": 178,
+        "pq": 0.2617383365075945,
+        "mean_iou": 0.6863360823976922,
+        "tp": 45,
+        "fp": 13,
+        "fn": 133
+      }
+    },
+    {
+      "image_id": "bbbc005_002_C53",
+      "dataset": "bbbc005",
+      "task_description": "count the individual cells",
+      "known_agent": "countgd",
+      "routed_agent": "countgd",
+      "routing_correct": true,
+      "blind_result": {
+        "count_target": "cell",
+        "predicted_count": 0,
+        "ground_truth_count": 53,
+        "mae": 53,
+        "within_tolerance": false
+      }
+    },
+    {
+      "image_id": "pannuke_f1_1171_Adrenal_gland",
+      "dataset": "pannuke",
+      "task_description": "segment the individual nuclei",
+      "known_agent": "stardist",
+      "routed_agent": "stardist",
+      "routing_correct": true,
+      "blind_result": {
+        "prob_thresh": 0.5,
+        "nms_thresh": 0.3,
+        "predicted_nuclei": 28,
+        "ground_truth_nuclei": 33,
+        "pq": 0.5989773486538582,
+        "mean_iou": 0.8304004151792125,
+        "tp": 22,
+        "fp": 6,
+        "fn": 11
+      }
     }
   ]
 }
